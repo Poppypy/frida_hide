@@ -17,7 +17,9 @@
 #include <asm/atomic.h>  // 替代 linux/atomic.h
 #include <uapi/asm-generic/unistd.h>
 #include <asm/current.h>
-
+#include <linux/gfp.h>       // 添加：用于 GFP_KERNEL
+#include <linux/kstrtox.h>   // 添加：用于 kstrtoint
+#include <linux/slab.h>      // 已有：用于 kmalloc/kfree
 #ifndef MYKPM_VERSION
 #define MYKPM_VERSION "2.0"
 #endif
@@ -42,11 +44,6 @@
 #define __NR_getdents64 61
 #endif
 
-KPM_NAME("FridaHide");
-KPM_VERSION(MYKPM_VERSION);
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("frida_hide_v2");
-KPM_DESCRIPTION("Advanced Frida detection bypass for Android");
 
 
 KPM_NAME("FridaHide");
@@ -324,7 +321,7 @@ static void before_connect(hook_fargs3_t *args, void *udata)
 }
 
 // [4] Hook: readlink 通用处理
-static void after_readlink_common(void *user_buf_ptr, long *ret_ptr)
+static void after_readlink_common(void *user_buf_ptr, uint64_t *ret_ptr)
 {
     if (!is_target_process()) return;
     
