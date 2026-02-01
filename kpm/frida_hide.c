@@ -14,7 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/slab.h>      // 添加：用于 kmalloc/kfree
-#include <linux/atomic.h>    // 添加：用于 atomic_t#include <uapi/asm-generic/errno.h>
+#include <asm/atomic.h>  // 替代 linux/atomic.h
 #include <uapi/asm-generic/unistd.h>
 #include <asm/current.h>
 
