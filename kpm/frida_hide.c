@@ -3,23 +3,25 @@
 #include <log.h>
 #include <kpmodule.h>
 #include <hook.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <syscall.h>
-#include <compiler.h>
 #include <kputils.h>
+
+// 标准内核头文件
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <linux/slab.h>      // 添加：用于 kmalloc/kfree
-#include <asm/atomic.h>  // 替代 linux/atomic.h
-#include <uapi/asm-generic/unistd.h>
+#include <linux/slab.h>
+#include <linux/gfp.h>
+#include <linux/errno.h>
+#include <asm/atomic.h>
 #include <asm/current.h>
-#include <linux/gfp.h>       // 添加：用于 GFP_KERNEL
-#include <linux/kstrtox.h>   // 添加：用于 kstrtoint
-#include <linux/slab.h>      // 已有：用于 kmalloc/kfree
+#include <uapi/asm-generic/unistd.h>
+
+// 基础类型
+#include <linux/types.h>
+
 #ifndef MYKPM_VERSION
 #define MYKPM_VERSION "2.0"
 #endif
@@ -37,14 +39,9 @@
 #ifndef __NR_openat
 #define __NR_openat 56
 #endif
-#ifndef __NR_statfs
-#define __NR_statfs 43
-#endif
 #ifndef __NR_getdents64
 #define __NR_getdents64 61
 #endif
-
-
 
 KPM_NAME("FridaHide");
 KPM_VERSION(MYKPM_VERSION);
@@ -74,7 +71,6 @@ struct sockaddr_in {
     unsigned char __pad[8];
 };
 
-// 已手动定义，无需 #include <linux/dirent.h>
 struct linux_dirent64 {
     u64 d_ino;
     s64 d_off;
@@ -85,13 +81,13 @@ struct linux_dirent64 {
 
 #define AF_INET 2
 #define DT_LNK 10
+
 // ==========================================
 // 配置与全局变量
 // ==========================================
 
-// 配置
 static int TARGET_PORT = 27042;
-static char TARGET_PACKAGE[256] = "com.example.app"; // 目标包名，留空则全局生效
+static char TARGET_PACKAGE[256] = ""; // 留空则全局生效
 
 // 函数指针
 static void *show_map_vma = NULL;
@@ -113,7 +109,7 @@ static int frida_hide_enabled = 1;
 static int frida_hide_log_enabled = 1;
 static int frida_hide_log_verbose = 0;
 
-// 统计计数器（减少日志噪音）
+// 统计计数器
 static atomic_t stat_maps_hidden = ATOMIC_INIT(0);
 static atomic_t stat_readlink_hidden = ATOMIC_INIT(0);
 static atomic_t stat_comm_hidden = ATOMIC_INIT(0);
@@ -134,41 +130,46 @@ static atomic_t stat_fd_hidden = ATOMIC_INIT(0);
 // 辅助函数
 // ==========================================
 
-static inline uint16_t local_ntohs(uint16_t val) {
+static inline uint16_t local_ntohs(uint16_t val)
+{
     return (val << 8) | (val >> 8);
 }
 
-// 优化的内存搜索（大小写不敏感）
-static void *memmem_case_insensitive(const void *haystack, size_t haystacklen, 
+// 大小写不敏感的内存搜索
+static void *memmem_case_insensitive(const void *haystack, size_t haystacklen,
                                       const void *needle, size_t needlelen)
 {
+    const unsigned char *h, *n;
+    size_t i, j;
+
     if (!haystack || !needle || haystacklen < needlelen || needlelen == 0)
         return NULL;
-    
-    const unsigned char *h = haystack;
-    const unsigned char *n = needle;
-    
-    for (size_t i = 0; i <= haystacklen - needlelen; ++i) {
-        size_t j;
+
+    h = haystack;
+    n = needle;
+
+    for (i = 0; i <= haystacklen - needlelen; ++i) {
         for (j = 0; j < needlelen; ++j) {
             unsigned char hc = h[i + j];
             unsigned char nc = n[j];
-            // 转小写比较
             if (hc >= 'A' && hc <= 'Z') hc += 32;
             if (nc >= 'A' && nc <= 'Z') nc += 32;
             if (hc != nc) break;
         }
-        if (j == needlelen) return (void *)(h + i);
+        if (j == needlelen)
+            return (void *)(h + i);
     }
     return NULL;
 }
 
-// 检查是否为目标进程（如果配置了包名）
+// 检查是否为目标进程
 static int is_target_process(void)
 {
-    if (TARGET_PACKAGE[0] == '\0') return 1; // 未配置则全局生效
-    
     char comm[TASK_COMM_LEN];
+
+    if (TARGET_PACKAGE[0] == '\0')
+        return 1;
+
     if (__get_task_comm) {
         __get_task_comm(comm, sizeof(comm), current);
         return (strstr(comm, TARGET_PACKAGE) != NULL);
@@ -176,7 +177,7 @@ static int is_target_process(void)
     return 0;
 }
 
-// 增强的敏感内容检测
+// 敏感内容检测
 static int is_sensitive_content(const char *buffer, size_t len)
 {
     static const char *keywords[] = {
@@ -191,8 +192,9 @@ static int is_sensitive_content(const char *buffer, size_t len)
         "/memfd:frida",
         NULL
     };
+    int i;
 
-    for (int i = 0; keywords[i] != NULL; ++i) {
+    for (i = 0; keywords[i] != NULL; ++i) {
         if (memmem_case_insensitive(buffer, len, keywords[i], strlen(keywords[i])))
             return 1;
     }
@@ -206,9 +208,11 @@ static int is_sensitive_comm(const char *comm)
         "gmain", "gum-js-loop", "gdbus",
         "pool-frida", "linjector", "frida"
     };
-    
-    for (int i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
-        if (strstr(comm, keywords[i])) return 1;
+    size_t i;
+
+    for (i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strstr(comm, keywords[i]))
+            return 1;
     }
     return 0;
 }
@@ -217,15 +221,16 @@ static int is_sensitive_comm(const char *comm)
 static int is_sensitive_path(const char *path)
 {
     static const char *patterns[] = {
-        "/proc/", "/sys/", "/dev/",
         "frida", "gum", "linjector",
         "/data/local/tmp/re.frida",
         "/data/adb/modules/magisk-frida",
         NULL
     };
-    
-    for (int i = 0; patterns[i] != NULL; ++i) {
-        if (strstr(path, patterns[i])) return 1;
+    int i;
+
+    for (i = 0; patterns[i] != NULL; ++i) {
+        if (strstr(path, patterns[i]))
+            return 1;
     }
     return 0;
 }
@@ -234,123 +239,148 @@ static int is_sensitive_path(const char *path)
 // Hook 实现
 // ==========================================
 
-// [1] Hook: show_map_vma - 逐行过滤 maps
+// [1] Hook: show_map_vma
 static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 {
-    if (!is_target_process()) return;
-    
-    struct seq_file *m = (struct seq_file *)args->arg0;
-    if (!m) return;
-    
-    args->local.data0 = m->count; // 保存当前位置
+    struct seq_file *m;
+
+    if (!is_target_process())
+        return;
+
+    m = (struct seq_file *)args->arg0;
+    if (!m)
+        return;
+
+    args->local.data0 = m->count;
 }
 
 static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 {
-    if (!is_target_process()) return;
-    
-    struct seq_file *m = (struct seq_file *)args->arg0;
-    if (!m || !m->buf) return;
-    
-    size_t old_count = args->local.data0;
-    size_t new_count = m->count;
-    
-    // 检查新增的内容
+    struct seq_file *m;
+    size_t old_count, new_count, new_len;
+    char *new_content;
+
+    if (!is_target_process())
+        return;
+
+    m = (struct seq_file *)args->arg0;
+    if (!m || !m->buf)
+        return;
+
+    old_count = args->local.data0;
+    new_count = m->count;
+
     if (new_count > old_count) {
-        char *new_content = m->buf + old_count;
-        size_t new_len = new_count - old_count;
-        
+        new_content = m->buf + old_count;
+        new_len = new_count - old_count;
+
         if (is_sensitive_content(new_content, new_len)) {
-            m->count = old_count; // 回滚，丢弃这一行
+            m->count = old_count;
             atomic_inc(&stat_maps_hidden);
             FH_LOGD("maps: hidden line (total: %d)\n", atomic_read(&stat_maps_hidden));
         }
     }
 }
 
-// [2] Hook: get_task_comm - 伪装线程名
+// [2] Hook: get_task_comm
 static void after_get_task_comm(hook_fargs3_t *args, void *udata)
 {
-    if (!is_target_process()) return;
-    
-    char *comm = (char *)args->arg0;
-    if (!comm) return;
-    
+    char *comm;
+    const char *fake_names[] = {
+        "Binder", "RenderThread", "HeapTaskDaemon",
+        "FinalizerDaemon", "AsyncTask"
+    };
+    int idx;
+
+    if (!is_target_process())
+        return;
+
+    comm = (char *)args->arg0;
+    if (!comm)
+        return;
+
     if (is_sensitive_comm(comm)) {
-        // 伪装成常见的系统线程名
-        const char *fake_names[] = {
-            "Binder", "RenderThread", "HeapTaskDaemon",
-            "FinalizerDaemon", "AsyncTask"
-        };
-        int idx = (int)(args->arg1) % (sizeof(fake_names) / sizeof(fake_names[0]));
+        idx = (int)(args->arg1) % (sizeof(fake_names) / sizeof(fake_names[0]));
         strncpy(comm, fake_names[idx], TASK_COMM_LEN - 1);
         comm[TASK_COMM_LEN - 1] = '\0';
-        
+
         atomic_inc(&stat_comm_hidden);
-        FH_LOGD("comm: %s -> %s (total: %d)\n", 
-                (char*)args->arg0, comm, atomic_read(&stat_comm_hidden));
+        FH_LOGD("comm: hidden -> %s (total: %d)\n",
+                comm, atomic_read(&stat_comm_hidden));
     }
 }
 
-// [3] Hook: connect - 端口保护
+// [3] Hook: connect
 static void before_connect(hook_fargs3_t *args, void *udata)
 {
     struct sockaddr_in addr_kernel;
-    const void __user *addr_user = (const void __user *)(uintptr_t)syscall_argn(args, 1);
+    const void __user *addr_user;
+    uint16_t port;
+    char comm[TASK_COMM_LEN];
 
-    if (!addr_user || !__arch_copy_from_user) return;
-    if (__arch_copy_from_user(&addr_kernel, addr_user, sizeof(addr_kernel)) != 0) return;
+    addr_user = (const void __user *)(uintptr_t)syscall_argn(args, 1);
 
-    if (addr_kernel.sin_family != AF_INET) return;
-    uint16_t port = local_ntohs(addr_kernel.sin_port);
+    if (!addr_user || !__arch_copy_from_user)
+        return;
+
+    if (__arch_copy_from_user(&addr_kernel, addr_user, sizeof(addr_kernel)) != 0)
+        return;
+
+    if (addr_kernel.sin_family != AF_INET)
+        return;
+
+    port = local_ntohs(addr_kernel.sin_port);
 
     if (port == TARGET_PORT || port == 27042 || port == 27043) {
-        char comm[TASK_COMM_LEN];
         if (__get_task_comm) {
             __get_task_comm(comm, sizeof(comm), current);
-            // 白名单：允许 adbd/shell
             if (!strstr(comm, "adbd") && !strstr(comm, "sh")) {
                 atomic_inc(&stat_connect_blocked);
-                FH_LOGW("connect: BLOCKED port %d from %s (total: %d)\n", 
+                FH_LOGW("connect: BLOCKED port %d from %s (total: %d)\n",
                         port, comm, atomic_read(&stat_connect_blocked));
                 args->skip_origin = 1;
-                args->ret = -ECONNREFUSED; // 伪装成连接被拒绝
+                args->ret = -ECONNREFUSED;
             }
         }
     }
 }
 
 // [4] Hook: readlink 通用处理
-static void after_readlink_common(void *user_buf_ptr, uint64_t *ret_ptr)
+static void after_readlink_common(void *user_buf_ptr, long *ret_ptr)
 {
-    if (!is_target_process()) return;
-    
-    long ret = *ret_ptr;
-    if (ret <= 0 || !user_buf_ptr || !__arch_copy_from_user || !__arch_copy_to_user) 
+    long ret, read_len;
+    char kbuf[512];
+    const char *fake_path;
+    size_t fake_len;
+
+    if (!is_target_process())
         return;
 
-    char kbuf[512];
-    long read_len = min(ret, (long)(sizeof(kbuf) - 1));
-    
-    if (__arch_copy_from_user(kbuf, user_buf_ptr, read_len) != 0) return;
+    ret = *ret_ptr;
+    if (ret <= 0 || !user_buf_ptr || !__arch_copy_from_user || !__arch_copy_to_user)
+        return;
+
+    read_len = min(ret, (long)(sizeof(kbuf) - 1));
+
+    if (__arch_copy_from_user(kbuf, user_buf_ptr, read_len) != 0)
+        return;
+
     kbuf[read_len] = '\0';
 
     if (is_sensitive_content(kbuf, read_len)) {
-        // 根据原路径类型选择伪造目标
-        const char *fake_path;
         if (strstr(kbuf, "/memfd:")) {
-            fake_path = "/dev/ashmem/dalvik-main space"; // 伪装成正常的 memfd
+            fake_path = "/dev/ashmem/dalvik-main space";
         } else if (strstr(kbuf, ".so")) {
-            fake_path = "/system/lib64/libc.so"; // 伪装成系统库
+            fake_path = "/system/lib64/libc.so";
         } else {
             fake_path = "/dev/null";
         }
-        
-        size_t fake_len = strlen(fake_path);
+
+        fake_len = strlen(fake_path);
         if (__arch_copy_to_user(user_buf_ptr, fake_path, fake_len) == 0) {
             *ret_ptr = fake_len;
             atomic_inc(&stat_readlink_hidden);
-            FH_LOGD("readlink: %s -> %s (total: %d)\n", 
+            FH_LOGD("readlink: %s -> %s (total: %d)\n",
                     kbuf, fake_path, atomic_read(&stat_readlink_hidden));
         }
     }
@@ -368,81 +398,94 @@ static void after_readlink(hook_fargs3_t *args, void *udata)
     after_readlink_common(user_buf, &args->ret);
 }
 
-// [5] Hook: openat - 阻止打开敏感文件
+// [5] Hook: openat
 static void before_openat(hook_fargs4_t *args, void *udata)
 {
-    if (!is_target_process()) return;
-    
-    const char __user *pathname_user = (const char __user *)(uintptr_t)syscall_argn(args, 1);
-    if (!pathname_user || !__arch_copy_from_user) return;
-    
+    const char __user *pathname_user;
     char pathname[256];
-    if (__arch_copy_from_user(pathname, pathname_user, sizeof(pathname) - 1) != 0) return;
+
+    if (!is_target_process())
+        return;
+
+    pathname_user = (const char __user *)(uintptr_t)syscall_argn(args, 1);
+    if (!pathname_user || !__arch_copy_from_user)
+        return;
+
+    if (__arch_copy_from_user(pathname, pathname_user, sizeof(pathname) - 1) != 0)
+        return;
+
     pathname[sizeof(pathname) - 1] = '\0';
-    
-    // 检查是否尝试打开敏感路径
+
     if (is_sensitive_path(pathname)) {
         atomic_inc(&stat_openat_blocked);
-        FH_LOGD("openat: BLOCKED %s (total: %d)\n", 
+        FH_LOGD("openat: BLOCKED %s (total: %d)\n",
                 pathname, atomic_read(&stat_openat_blocked));
         args->skip_origin = 1;
-        args->ret = -ENOENT; // 文件不存在
+        args->ret = -ENOENT;
     }
 }
 
-// [6] Hook: getdents64 - 隐藏 /proc/self/fd 中的敏感项
+// [6] Hook: getdents64
 static void after_getdents64(hook_fargs3_t *args, void *udata)
 {
-    if (!is_target_process()) return;
-    
-    long ret = args->ret;
-    if (ret <= 0) return;
-    
-    void __user *dirent_user = (void __user *)(uintptr_t)syscall_argn(args, 1);
-    if (!dirent_user || !__arch_copy_from_user || !__arch_copy_to_user) return;
-    
-    // 分配内核缓冲区
-    char *kbuf = kmalloc(ret, GFP_KERNEL);
-    if (!kbuf) return;
-    
+    long ret, pos, new_pos;
+    void __user *dirent_user;
+    char *kbuf;
+    int hidden_count;
+    struct linux_dirent64 *d;
+    int should_hide;
+
+    if (!is_target_process())
+        return;
+
+    ret = args->ret;
+    if (ret <= 0)
+        return;
+
+    dirent_user = (void __user *)(uintptr_t)syscall_argn(args, 1);
+    if (!dirent_user || !__arch_copy_from_user || !__arch_copy_to_user)
+        return;
+
+    kbuf = kmalloc(ret, GFP_KERNEL);
+    if (!kbuf)
+        return;
+
     if (__arch_copy_from_user(kbuf, dirent_user, ret) != 0) {
         kfree(kbuf);
         return;
     }
-    
-    // 遍历目录项，过滤敏感项
-    long pos = 0;
-    long new_pos = 0;
-    int hidden_count = 0;
-    
+
+    pos = 0;
+    new_pos = 0;
+    hidden_count = 0;
+
     while (pos < ret) {
-        struct linux_dirent64 *d = (struct linux_dirent64 *)(kbuf + pos);
-        int should_hide = 0;
-        
-        // 检查文件名是否敏感
+        d = (struct linux_dirent64 *)(kbuf + pos);
+        should_hide = 0;
+
         if (is_sensitive_content(d->d_name, strlen(d->d_name))) {
             should_hide = 1;
             hidden_count++;
         }
-        
+
         if (!should_hide) {
             if (new_pos != pos) {
                 memmove(kbuf + new_pos, kbuf + pos, d->d_reclen);
             }
             new_pos += d->d_reclen;
         }
-        
+
         pos += d->d_reclen;
     }
-    
+
     if (hidden_count > 0) {
         __arch_copy_to_user(dirent_user, kbuf, new_pos);
         args->ret = new_pos;
         atomic_add(hidden_count, &stat_fd_hidden);
-        FH_LOGD("getdents64: hidden %d entries (total: %d)\n", 
+        FH_LOGD("getdents64: hidden %d entries (total: %d)\n",
                 hidden_count, atomic_read(&stat_fd_hidden));
     }
-    
+
     kfree(kbuf);
 }
 
@@ -453,18 +496,18 @@ static void after_getdents64(hook_fargs3_t *args, void *udata)
 void frida_hide_install(void)
 {
     FH_LOGI("Installing hooks (v%s)...\n", MYKPM_VERSION);
-    
+
     // 初始化函数指针
     __arch_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
-    if (!__arch_copy_from_user) 
+    if (!__arch_copy_from_user)
         __arch_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
-    
+
     __arch_copy_to_user = (void *)kallsyms_lookup_name("__arch_copy_to_user");
-    if (!__arch_copy_to_user) 
+    if (!__arch_copy_to_user)
         __arch_copy_to_user = (void *)kallsyms_lookup_name("_copy_to_user");
-    
+
     __get_task_comm = (void *)kallsyms_lookup_name("__get_task_comm");
-    if (!__get_task_comm) 
+    if (!__get_task_comm)
         __get_task_comm = (void *)kallsyms_lookup_name("get_task_comm");
 
     // 1. Hook show_map_vma
@@ -472,7 +515,7 @@ void frida_hide_install(void)
     if (show_map_vma) {
         if (hook_wrap2(show_map_vma, before_show_map_vma, after_show_map_vma, NULL) == HOOK_NO_ERR) {
             show_map_vma_hook_status = 1;
-            FH_LOGI("✓ show_map_vma hooked\n");
+            FH_LOGI("+ show_map_vma hooked\n");
         }
     }
 
@@ -480,7 +523,7 @@ void frida_hide_install(void)
     if (__get_task_comm) {
         if (hook_wrap3(__get_task_comm, NULL, after_get_task_comm, NULL) == HOOK_NO_ERR) {
             get_task_comm_hook_status = 1;
-            FH_LOGI("✓ get_task_comm hooked\n");
+            FH_LOGI("+ get_task_comm hooked\n");
         }
     }
 
@@ -488,7 +531,7 @@ void frida_hide_install(void)
     if (__arch_copy_from_user && __get_task_comm) {
         if (fp_hook_syscalln(__NR_connect, 3, before_connect, NULL, NULL) == HOOK_NO_ERR) {
             connect_hook_status = 1;
-            FH_LOGI("✓ connect hooked (port: %d)\n", TARGET_PORT);
+            FH_LOGI("+ connect hooked (port: %d)\n", TARGET_PORT);
         }
     }
 
@@ -496,108 +539,114 @@ void frida_hide_install(void)
     if (__arch_copy_from_user && __arch_copy_to_user) {
         if (fp_hook_syscalln(__NR_readlinkat, 4, NULL, after_readlinkat, NULL) == HOOK_NO_ERR) {
             readlinkat_hook_status = 1;
-            FH_LOGI("✓ readlinkat hooked\n");
+            FH_LOGI("+ readlinkat hooked\n");
         }
         if (fp_hook_syscalln(__NR_readlink, 3, NULL, after_readlink, NULL) == HOOK_NO_ERR) {
             readlink_hook_status = 1;
-            FH_LOGI("✓ readlink hooked\n");
+            FH_LOGI("+ readlink hooked\n");
         }
     }
 
-    // 5. Hook openat (新增)
+    // 5. Hook openat
     if (__arch_copy_from_user) {
         if (fp_hook_syscalln(__NR_openat, 4, before_openat, NULL, NULL) == HOOK_NO_ERR) {
             openat_hook_status = 1;
-            FH_LOGI("✓ openat hooked\n");
+            FH_LOGI("+ openat hooked\n");
         }
     }
 
-    // 6. Hook getdents64 (新增 - 隐藏 fd 目录项)
+    // 6. Hook getdents64
     if (__arch_copy_from_user && __arch_copy_to_user) {
         if (fp_hook_syscalln(__NR_getdents64, 3, NULL, after_getdents64, NULL) == HOOK_NO_ERR) {
             getdents64_hook_status = 1;
-            FH_LOGI("✓ getdents64 hooked\n");
+            FH_LOGI("+ getdents64 hooked\n");
         }
     }
 
-    FH_LOGI("Installation complete. Active hooks: %d\n",
-            show_map_vma_hook_status + get_task_comm_hook_status + 
-            connect_hook_status + readlinkat_hook_status + 
+        FH_LOGI("Installation complete. Active hooks: %d\n",
+            show_map_vma_hook_status + get_task_comm_hook_status +
+            connect_hook_status + readlinkat_hook_status +
             readlink_hook_status + openat_hook_status + getdents64_hook_status);
 }
 
 void frida_hide_uninstall(void)
 {
     FH_LOGI("Uninstalling hooks...\n");
-    
+
     if (show_map_vma_hook_status) {
         unhook(show_map_vma);
         show_map_vma_hook_status = 0;
     }
-    
+
     if (get_task_comm_hook_status) {
         unhook(__get_task_comm);
         get_task_comm_hook_status = 0;
     }
-    
+
     if (connect_hook_status) {
         fp_unhook_syscalln(__NR_connect, before_connect, NULL);
         connect_hook_status = 0;
     }
-    
+
     if (readlinkat_hook_status) {
         fp_unhook_syscalln(__NR_readlinkat, NULL, after_readlinkat);
         readlinkat_hook_status = 0;
     }
-    
+
     if (readlink_hook_status) {
         fp_unhook_syscalln(__NR_readlink, NULL, after_readlink);
         readlink_hook_status = 0;
     }
-    
+
     if (openat_hook_status) {
         fp_unhook_syscalln(__NR_openat, before_openat, NULL);
         openat_hook_status = 0;
     }
-    
+
     if (getdents64_hook_status) {
         fp_unhook_syscalln(__NR_getdents64, NULL, after_getdents64);
         getdents64_hook_status = 0;
     }
-    
+
     FH_LOGI("Uninstall complete\n");
 }
 
 static long frida_hide_init(const char *args, const char *event, void *reserved)
 {
+    char *args_copy, *token, *cur;
+    int new_port;
+
     FH_LOGI("FridaHide v%s initializing...\n", MYKPM_VERSION);
-    
+
     // 解析参数 (格式: "port=27042,package=com.example.app")
     if (args && strlen(args) > 0) {
-        char *args_copy = kstrdup(args, GFP_KERNEL);
-    if (args_copy) {
-        char *token, *cur = args_copy;
-        while ((token = strsep(&cur, ","))) {
-            if (strncmp(token, "port=", 5) == 0) {
-                kstrtoint(token + 5, 10, &TARGET_PORT);
-                FH_LOGI("Config: port=%d\n", TARGET_PORT);
-            } else if (strncmp(token, "package=", 8) == 0) {
-                strncpy(TARGET_PACKAGE, token + 8, sizeof(TARGET_PACKAGE) - 1);
-                TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
-                FH_LOGI("Config: package=%s\n", TARGET_PACKAGE);
-            } else if (strcmp(token, "verbose") == 0) {
-                frida_hide_log_verbose = 1;
-                FH_LOGI("Config: verbose logging enabled\n");
+        args_copy = kstrdup(args, GFP_KERNEL);
+        if (args_copy) {
+            cur = args_copy;
+            while ((token = strsep(&cur, ","))) {
+                if (strncmp(token, "port=", 5) == 0) {
+                    // 使用简单的字符串转整数
+                    if (kstrtoint(token + 5, 10, &new_port) == 0) {
+                        TARGET_PORT = new_port;
+                        FH_LOGI("Config: port=%d\n", TARGET_PORT);
+                    }
+                } else if (strncmp(token, "package=", 8) == 0) {
+                    strncpy(TARGET_PACKAGE, token + 8, sizeof(TARGET_PACKAGE) - 1);
+                    TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
+                    FH_LOGI("Config: package=%s\n", TARGET_PACKAGE);
+                } else if (strcmp(token, "verbose") == 0) {
+                    frida_hide_log_verbose = 1;
+                    FH_LOGI("Config: verbose logging enabled\n");
+                }
             }
+            kfree(args_copy);
         }
-        kfree(args_copy);
     }
-    }
-    
+
     if (frida_hide_enabled) {
         frida_hide_install();
     }
-    
+
     return 0;
 }
 
@@ -605,7 +654,7 @@ static long frida_hide_exit(void *reserved)
 {
     FH_LOGI("FridaHide exiting...\n");
     frida_hide_uninstall();
-    
+
     // 打印统计信息
     FH_LOGI("Statistics:\n");
     FH_LOGI("  Maps hidden: %d\n", atomic_read(&stat_maps_hidden));
@@ -614,7 +663,7 @@ static long frida_hide_exit(void *reserved)
     FH_LOGI("  Connects blocked: %d\n", atomic_read(&stat_connect_blocked));
     FH_LOGI("  Openats blocked: %d\n", atomic_read(&stat_openat_blocked));
     FH_LOGI("  FDs hidden: %d\n", atomic_read(&stat_fd_hidden));
-    
+
     return 0;
 }
 
@@ -622,6 +671,7 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
 {
     char reply_msg[512];
     int reply_len = 0;
+    int new_port;
 
     if (!args || !strncmp(args, "STATUS", 6)) {
         // 状态查询
@@ -649,13 +699,13 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
             frida_hide_enabled ? "YES" : "NO",
             TARGET_PACKAGE[0] ? TARGET_PACKAGE : "(all processes)",
             TARGET_PORT,
-            show_map_vma_hook_status ? "✓" : "✗",
-            get_task_comm_hook_status ? "✓" : "✗",
-            connect_hook_status ? "✓" : "✗",
-            readlinkat_hook_status ? "✓" : "✗",
-            readlink_hook_status ? "✓" : "✗",
-            openat_hook_status ? "✓" : "✗",
-            getdents64_hook_status ? "✓" : "✗",
+            show_map_vma_hook_status ? "+" : "-",
+            get_task_comm_hook_status ? "+" : "-",
+            connect_hook_status ? "+" : "-",
+            readlinkat_hook_status ? "+" : "-",
+            readlink_hook_status ? "+" : "-",
+            openat_hook_status ? "+" : "-",
+            getdents64_hook_status ? "+" : "-",
             atomic_read(&stat_maps_hidden),
             atomic_read(&stat_readlink_hidden),
             atomic_read(&stat_comm_hidden),
@@ -663,14 +713,14 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
             atomic_read(&stat_openat_blocked),
             atomic_read(&stat_fd_hidden)
         );
-    } 
+    }
     else if (!strcmp(args, "ENABLE") || !strcmp(args, "EN")) {
         if (!frida_hide_enabled) {
             frida_hide_enabled = 1;
             frida_hide_install();
         }
         reply_len = snprintf(reply_msg, sizeof(reply_msg), "FridaHide enabled");
-    } 
+    }
     else if (!strcmp(args, "DISABLE") || !strcmp(args, "DIS")) {
         if (frida_hide_enabled) {
             frida_hide_enabled = 0;
@@ -679,10 +729,9 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
         reply_len = snprintf(reply_msg, sizeof(reply_msg), "FridaHide disabled");
     }
     else if (!strncmp(args, "PORT=", 5)) {
-        int new_port;
         if (kstrtoint(args + 5, 10, &new_port) == 0) {
             TARGET_PORT = new_port;
-            reply_len = snprintf(reply_msg, sizeof(reply_msg), 
+            reply_len = snprintf(reply_msg, sizeof(reply_msg),
                                 "Port updated to %d", TARGET_PORT);
         } else {
             reply_len = snprintf(reply_msg, sizeof(reply_msg), "Invalid port");
@@ -691,13 +740,13 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
     else if (!strncmp(args, "PACKAGE=", 8)) {
         strncpy(TARGET_PACKAGE, args + 8, sizeof(TARGET_PACKAGE) - 1);
         TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), 
+        reply_len = snprintf(reply_msg, sizeof(reply_msg),
                             "Package filter: %s", TARGET_PACKAGE);
     }
     else if (!strcmp(args, "VERBOSE")) {
         frida_hide_log_verbose = !frida_hide_log_verbose;
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), 
-                            "Verbose logging: %s", 
+        reply_len = snprintf(reply_msg, sizeof(reply_msg),
+                            "Verbose logging: %s",
                             frida_hide_log_verbose ? "ON" : "OFF");
     }
     else if (!strcmp(args, "RESET_STATS")) {
@@ -725,7 +774,7 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
             __arch_copy_to_user(out_msg, reply_msg, min(reply_len + 1, outlen));
         }
     }
-    
+
     return 0;
 }
 
