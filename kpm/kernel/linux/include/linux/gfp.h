@@ -2,6 +2,31 @@
 #define __LINUX_GFP_H
 
 #include <common.h>
+#include <ktypes.h>
+
+/*
+ * NOTE: KPM 通过 kfunc 调用内核分配器，因此 GFP 标志位必须与运行中的内核一致。
+ * 这里先提供常见 Android/Linux 内核上稳定的基础组合，满足模块编译与常规使用。
+ */
+#ifndef __GFP_IO
+#define __GFP_IO ((gfp_t)0x40u)
+#endif
+#ifndef __GFP_FS
+#define __GFP_FS ((gfp_t)0x80u)
+#endif
+#ifndef __GFP_DIRECT_RECLAIM
+#define __GFP_DIRECT_RECLAIM ((gfp_t)0x400u)
+#endif
+#ifndef __GFP_KSWAPD_RECLAIM
+#define __GFP_KSWAPD_RECLAIM ((gfp_t)0x800u)
+#endif
+#ifndef __GFP_RECLAIM
+#define __GFP_RECLAIM ((gfp_t)(__GFP_DIRECT_RECLAIM | __GFP_KSWAPD_RECLAIM))
+#endif
+
+#ifndef GFP_KERNEL
+#define GFP_KERNEL (__GFP_RECLAIM | __GFP_IO | __GFP_FS)
+#endif
 
 /* Plain integer GFP bitmasks. Do not use this directly. */
 // #define __GFP_DMA 0x01u

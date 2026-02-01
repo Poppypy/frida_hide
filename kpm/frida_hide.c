@@ -20,7 +20,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 // 基础类型
-#include <linux/types.h>
+#include <ktypes.h>
 
 #ifndef MYKPM_VERSION
 #define MYKPM_VERSION "2.0"
@@ -125,6 +125,25 @@ static atomic_t stat_fd_hidden = ATOMIC_INIT(0);
 #ifndef min
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #endif
+
+static int parse_port_arg(const char *s, int *out_port)
+{
+    unsigned long long port_ull;
+    int err;
+
+    if (!s || !out_port)
+        return -EINVAL;
+
+    err = kstrtoull(s, 10, &port_ull);
+    if (err)
+        return err;
+
+    if (port_ull > 65535)
+        return -ERANGE;
+
+    *out_port = (int)port_ull;
+    return 0;
+}
 
 // ==========================================
 // 辅助函数
@@ -346,7 +365,7 @@ static void before_connect(hook_fargs3_t *args, void *udata)
 }
 
 // [4] Hook: readlink 通用处理
-static void after_readlink_common(void *user_buf_ptr, long *ret_ptr)
+static void after_readlink_common(void *user_buf_ptr, uint64_t *ret_ptr)
 {
     long ret, read_len;
     char kbuf[512];
@@ -356,7 +375,7 @@ static void after_readlink_common(void *user_buf_ptr, long *ret_ptr)
     if (!is_target_process())
         return;
 
-    ret = *ret_ptr;
+    ret = (long)(*ret_ptr);
     if (ret <= 0 || !user_buf_ptr || !__arch_copy_from_user || !__arch_copy_to_user)
         return;
 
@@ -378,7 +397,7 @@ static void after_readlink_common(void *user_buf_ptr, long *ret_ptr)
 
         fake_len = strlen(fake_path);
         if (__arch_copy_to_user(user_buf_ptr, fake_path, fake_len) == 0) {
-            *ret_ptr = fake_len;
+            *ret_ptr = (uint64_t)fake_len;
             atomic_inc(&stat_readlink_hidden);
             FH_LOGD("readlink: %s -> %s (total: %d)\n",
                     kbuf, fake_path, atomic_read(&stat_readlink_hidden));
@@ -626,7 +645,7 @@ static long frida_hide_init(const char *args, const char *event, void *reserved)
             while ((token = strsep(&cur, ","))) {
                 if (strncmp(token, "port=", 5) == 0) {
                     // 使用简单的字符串转整数
-                    if (kstrtoint(token + 5, 10, &new_port) == 0) {
+                    if (parse_port_arg(token + 5, &new_port) == 0) {
                         TARGET_PORT = new_port;
                         FH_LOGI("Config: port=%d\n", TARGET_PORT);
                     }
@@ -729,7 +748,7 @@ static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
         reply_len = snprintf(reply_msg, sizeof(reply_msg), "FridaHide disabled");
     }
     else if (!strncmp(args, "PORT=", 5)) {
-        if (kstrtoint(args + 5, 10, &new_port) == 0) {
+        if (parse_port_arg(args + 5, &new_port) == 0) {
             TARGET_PORT = new_port;
             reply_len = snprintf(reply_msg, sizeof(reply_msg),
                                 "Port updated to %d", TARGET_PORT);
