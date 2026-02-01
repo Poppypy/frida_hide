@@ -13,8 +13,8 @@
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <linux/dirent.h>
-#include <uapi/asm-generic/errno.h>
+#include <linux/slab.h>      // 添加：用于 kmalloc/kfree
+#include <linux/atomic.h>    // 添加：用于 atomic_t#include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm/current.h>
 
@@ -48,6 +48,13 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("frida_hide_v2");
 KPM_DESCRIPTION("Advanced Frida detection bypass for Android");
 
+
+KPM_NAME("FridaHide");
+KPM_VERSION(MYKPM_VERSION);
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("frida_hide_v2");
+KPM_DESCRIPTION("Advanced Frida detection bypass for Android");
+
 // ==========================================
 // 结构体定义
 // ==========================================
@@ -70,6 +77,7 @@ struct sockaddr_in {
     unsigned char __pad[8];
 };
 
+// 已手动定义，无需 #include <linux/dirent.h>
 struct linux_dirent64 {
     u64 d_ino;
     s64 d_off;
@@ -80,7 +88,6 @@ struct linux_dirent64 {
 
 #define AF_INET 2
 #define DT_LNK 10
-
 // ==========================================
 // 配置与全局变量
 // ==========================================
@@ -571,24 +578,23 @@ static long frida_hide_init(const char *args, const char *event, void *reserved)
     // 解析参数 (格式: "port=27042,package=com.example.app")
     if (args && strlen(args) > 0) {
         char *args_copy = kstrdup(args, GFP_KERNEL);
-        if (args_copy) {
-            char *token, *saveptr;
-            token = strtok_r(args_copy, ",", &saveptr);
-            while (token) {
-                if (strncmp(token, "port=", 5) == 0) {
-                    kstrtoint(token + 5, 10, &TARGET_PORT);
-                    FH_LOGI("Config: port=%d\n", TARGET_PORT);
-                } else if (strncmp(token, "package=", 8) == 0) {
-                    strncpy(TARGET_PACKAGE, token + 8, sizeof(TARGET_PACKAGE) - 1);
-                    FH_LOGI("Config: package=%s\n", TARGET_PACKAGE);
-                } else if (strcmp(token, "verbose") == 0) {
-                    frida_hide_log_verbose = 1;
-                    FH_LOGI("Config: verbose logging enabled\n");
-                }
-                token = strtok_r(NULL, ",", &saveptr);
+    if (args_copy) {
+        char *token, *cur = args_copy;
+        while ((token = strsep(&cur, ","))) {
+            if (strncmp(token, "port=", 5) == 0) {
+                kstrtoint(token + 5, 10, &TARGET_PORT);
+                FH_LOGI("Config: port=%d\n", TARGET_PORT);
+            } else if (strncmp(token, "package=", 8) == 0) {
+                strncpy(TARGET_PACKAGE, token + 8, sizeof(TARGET_PACKAGE) - 1);
+                TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
+                FH_LOGI("Config: package=%s\n", TARGET_PACKAGE);
+            } else if (strcmp(token, "verbose") == 0) {
+                frida_hide_log_verbose = 1;
+                FH_LOGI("Config: verbose logging enabled\n");
             }
-            kfree(args_copy);
         }
+        kfree(args_copy);
+    }
     }
     
     if (frida_hide_enabled) {
