@@ -29,7 +29,7 @@
 KPM_NAME("FridaHide");
 KPM_VERSION(MYKPM_VERSION);
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("frida_hide");
+KPM_AUTHOR("popy");
 KPM_DESCRIPTION("Hide Frida traces in maps/threads/connect");
 
 
@@ -95,9 +95,9 @@ static void *memmem_local(const void *haystack, size_t haystacklen, const void *
 }
 
 // 检查 seq_file 缓冲区中是否包含敏感关键词
-static int is_hiden_module(struct seq_file *m)
+static const char *get_hiden_module_keyword(struct seq_file *m)
 {
-    if (!m || !m->buf || m->count == 0) return false;
+    if (!m || !m->buf || m->count == 0) return NULL;
     // 需要隐藏的关键词列表
     static const char *keywords[] = {
         "frida-agent",
@@ -110,12 +110,12 @@ static int is_hiden_module(struct seq_file *m)
 
     for (int i = 0; keywords[i] != NULL; ++i) {
         if (memmem_local(m->buf, m->count, keywords[i], strlen(keywords[i])))
-            return 1;
+            return keywords[i];
     }
-    return 0;
+    return NULL;
 }
 
-static int is_hiden_comm(const char *comm)
+static const char *get_hiden_comm_keyword(const char *comm)
 {
     // 需要隐藏的线程名关键词列表
     static const char *keywords[] = {
@@ -124,14 +124,15 @@ static int is_hiden_comm(const char *comm)
         "gdbus",
         "pool-frida",
         "linjector",
+        NULL
     };
 
-    for (int i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+    for (int i = 0; keywords[i] != NULL; i++) {
         if (strstr(comm, keywords[i])) {
-            return 1;
+            return keywords[i];
         }
     }
-    return 0;
+    return NULL;
 }
 
 static void before_show_map_vma(hook_fargs2_t *args, void *udata)
@@ -148,8 +149,9 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 {
     struct seq_file *m = (struct seq_file *)args->arg0;
     if (m && m->buf) {
-        if (args->local.data0 && is_hiden_module(m)) {  // is_hiden_module 查找 frida-agent 等字符串
-            FH_LOGI("inject-hide: maps hide -> frida-agent\n");
+        const char *keyword = NULL;
+        if (args->local.data0 && (keyword = get_hiden_module_keyword(m))) {  // get_hiden_module_keyword 查找 frida-agent 等字符串
+            FH_LOGI("inject-hide: maps hide -> %s\n", keyword);
             m->count = args->local.data0;  // 恢复原来的 count 值
         }
     }
@@ -160,8 +162,9 @@ static void __attribute__((optimize("O0"))) after_get_task_comm(hook_fargs3_t *a
     char *comm = (char *)args->arg0;
     size_t comm_buf_len = (size_t)args->arg1;
     if (comm && comm_buf_len) {
-        if (is_hiden_comm(comm)){
-            FH_LOGI("inject-hide: get_task_comm hide -> %s\n", comm);
+        const char *keyword = get_hiden_comm_keyword(comm);
+        if (keyword){
+            FH_LOGI("inject-hide: get_task_comm hide -> %s (matched: %s)\n", comm, keyword);
             size_t hide_len = strlen(comm);
             for(size_t i = 0; i < hide_len; i++) {
                 comm[i] = ' ';
