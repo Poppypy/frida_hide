@@ -3,794 +3,347 @@
 #include <log.h>
 #include <kpmodule.h>
 #include <hook.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <syscall.h>
+#include <compiler.h>
 #include <kputils.h>
-
-// 标准内核头文件
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/slab.h>
-#include <linux/gfp.h>
-#include <linux/errno.h>
-#include <asm/atomic.h>
-#include <asm/current.h>
+#include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/unistd.h>
-
-// 基础类型
-#include <ktypes.h>
+#include <asm/current.h>
 
 #ifndef MYKPM_VERSION
-#define MYKPM_VERSION "2.0"
+// VSCode IntelliSense 没有走 Makefile 的 -DMYKPM_VERSION 时会报红；编译时仍以 Makefile 传入为准。
+#define MYKPM_VERSION "dev"
 #endif
 
-// 系统调用号定义
 #ifndef __NR_connect
+// IntelliSense 兜底：正常编译会从 <uapi/asm-generic/unistd.h> 获得该宏。
 #define __NR_connect 203
-#endif
-#ifndef __NR_readlinkat
-#define __NR_readlinkat 78
-#endif
-#ifndef __NR_readlink
-#define __NR_readlink 58
-#endif
-#ifndef __NR_openat
-#define __NR_openat 56
-#endif
-#ifndef __NR_getdents64
-#define __NR_getdents64 61
 #endif
 
 KPM_NAME("FridaHide");
 KPM_VERSION(MYKPM_VERSION);
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("frida_hide_v2");
-KPM_DESCRIPTION("Advanced Frida detection bypass for Android");
+KPM_AUTHOR("frida_hide");
+KPM_DESCRIPTION("Hide Frida traces in maps/threads/connect");
 
-// ==========================================
-// 结构体定义
-// ==========================================
 
-struct seq_file {
+struct seq_file{
     char *buf;
-    size_t size;
-    size_t from;
-    size_t count;
-    loff_t index;
-    loff_t read_pos;
-    u64 version;
-    void *private;
+	size_t size;
+	size_t from;
+	size_t count;
 };
-
 struct sockaddr_in {
-    unsigned short sin_family;
-    unsigned short sin_port;
-    unsigned int sin_addr;
-    unsigned char __pad[8];
+    short sin_family;
+    unsigned short sin_port;     
+    unsigned int sin_addr;     
+    char sin_zero[8];
 };
 
-struct linux_dirent64 {
-    u64 d_ino;
-    s64 d_off;
-    unsigned short d_reclen;
-    unsigned char d_type;
-    char d_name[];
-};
-
-#define AF_INET 2
-#define DT_LNK 10
-
-// ==========================================
-// 配置与全局变量
-// ==========================================
-
-static int TARGET_PORT = 27042;
-static char TARGET_PACKAGE[256] = ""; // 留空则全局生效
-
-// 函数指针
 static void *show_map_vma = NULL;
-static char *(*__get_task_comm)(char *buf, size_t buf_size, struct task_struct *tsk) = NULL;
+static char *(*__get_task_comm)(char *buf, size_t buf_size, struct task_struct *tsk) = NULL;  // 为了后续能够调用，定义成函数指针变量
 static unsigned long (*__arch_copy_from_user)(void *to, const void __user *from, unsigned long n) = NULL;
-static unsigned long (*__arch_copy_to_user)(void __user *to, const void *from, unsigned long n) = NULL;
 
-// Hook 状态
 static int show_map_vma_hook_status = 0;
 static int get_task_comm_hook_status = 0;
 static int connect_hook_status = 0;
-static int readlinkat_hook_status = 0;
-static int readlink_hook_status = 0;
-static int openat_hook_status = 0;
-static int getdents64_hook_status = 0;
-
-// 运行时配置
 static int frida_hide_enabled = 1;
 static int frida_hide_log_enabled = 1;
 static int frida_hide_log_verbose = 0;
 
-// 统计计数器
-static atomic_t stat_maps_hidden = ATOMIC_INIT(0);
-static atomic_t stat_readlink_hidden = ATOMIC_INIT(0);
-static atomic_t stat_comm_hidden = ATOMIC_INIT(0);
-static atomic_t stat_connect_blocked = ATOMIC_INIT(0);
-static atomic_t stat_openat_blocked = ATOMIC_INIT(0);
-static atomic_t stat_fd_hidden = ATOMIC_INIT(0);
-
-// 日志宏
-#define FH_LOGI(fmt, ...) do { if (frida_hide_log_enabled) logki("[FH] " fmt, ##__VA_ARGS__); } while (0)
-#define FH_LOGW(fmt, ...) do { if (frida_hide_log_enabled) logkw("[FH] " fmt, ##__VA_ARGS__); } while (0)
-#define FH_LOGD(fmt, ...) do { if (frida_hide_log_verbose) logkd("[FH] " fmt, ##__VA_ARGS__); } while (0)
+#define FH_LOGI(fmt, ...)                       \
+    do {                                        \
+        if (frida_hide_log_enabled)             \
+            logki(fmt, ##__VA_ARGS__);          \
+    } while (0)
+#define FH_LOGW(fmt, ...)                       \
+    do {                                        \
+        if (frida_hide_log_enabled)             \
+            logkw(fmt, ##__VA_ARGS__);          \
+    } while (0)
+#define FH_LOGD(fmt, ...)                               \
+    do {                                                \
+        if (frida_hide_log_enabled && frida_hide_log_verbose) \
+            logkd(fmt, ##__VA_ARGS__);                  \
+    } while (0)
+#define FH_BOOT(fmt, ...)                      \
+    do {                                       \
+        if (frida_hide_log_enabled)            \
+            log_boot(fmt, ##__VA_ARGS__);      \
+    } while (0)
 
 #ifndef min
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #endif
 
-static int parse_port_arg(const char *s, int *out_port)
+// 内核环境下的 memmem 实现
+static void *memmem_local(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)
 {
-    unsigned long long port_ull;
-    int err;
-
-    if (!s || !out_port)
-        return -EINVAL;
-
-    err = kstrtoull(s, 10, &port_ull);
-    if (err)
-        return err;
-
-    if (port_ull > 65535)
-        return -ERANGE;
-
-    *out_port = (int)port_ull;
-    return 0;
-}
-
-// ==========================================
-// 辅助函数
-// ==========================================
-
-static inline uint16_t local_ntohs(uint16_t val)
-{
-    return (val << 8) | (val >> 8);
-}
-
-// 大小写不敏感的内存搜索
-static void *memmem_case_insensitive(const void *haystack, size_t haystacklen,
-                                      const void *needle, size_t needlelen)
-{
-    const unsigned char *h, *n;
-    size_t i, j;
-
     if (!haystack || !needle || haystacklen < needlelen || needlelen == 0)
         return NULL;
-
-    h = haystack;
-    n = needle;
-
-    for (i = 0; i <= haystacklen - needlelen; ++i) {
-        for (j = 0; j < needlelen; ++j) {
-            unsigned char hc = h[i + j];
-            unsigned char nc = n[j];
-            if (hc >= 'A' && hc <= 'Z') hc += 32;
-            if (nc >= 'A' && nc <= 'Z') nc += 32;
-            if (hc != nc) break;
-        }
-        if (j == needlelen)
-            return (void *)(h + i);
+    for (size_t i = 0; i <= haystacklen - needlelen; ++i) {
+        if (memcmp((const char *)haystack + i, needle, needlelen) == 0)
+            return (void *)((const char *)haystack + i);
     }
     return NULL;
 }
 
-// 检查是否为目标进程
-static int is_target_process(void)
+// 检查 seq_file 缓冲区中是否包含敏感关键词
+static int is_hiden_module(struct seq_file *m)
 {
-    char comm[TASK_COMM_LEN];
+    if (!m || !m->buf || m->count == 0) return false;
+    // 需要隐藏的关键词列表
+    static const char *keywords[] = {
+        "frida-agent",
+        "frida",
+        "gum-js-loop",
+        "GumJS",
+        "gmain",
+        NULL
+    };
 
-    if (TARGET_PACKAGE[0] == '\0')
-        return 1;
-
-    if (__get_task_comm) {
-        __get_task_comm(comm, sizeof(comm), current);
-        return (strstr(comm, TARGET_PACKAGE) != NULL);
+    for (int i = 0; keywords[i] != NULL; ++i) {
+        if (memmem_local(m->buf, m->count, keywords[i], strlen(keywords[i])))
+            return 1;
     }
     return 0;
 }
 
-// 敏感内容检测
-static int is_sensitive_content(const char *buffer, size_t len)
+static int is_hiden_comm(const char *comm)
 {
+    // 需要隐藏的线程名关键词列表
     static const char *keywords[] = {
-        "frida", "FRIDA",
-        "gum-js-loop", "GumJS",
-        "gmain", "gdbus",
+        "gmain",
+        "gum-js-loop",
+        "gdbus",
+        "pool-frida",
         "linjector",
-        "re.frida.server",
-        "/data/local/tmp/re.frida.server",
-        "frida-agent", "frida-helper",
-        "frida-gadget",
-        "/memfd:frida",
-        NULL
     };
-    int i;
 
-    for (i = 0; keywords[i] != NULL; ++i) {
-        if (memmem_case_insensitive(buffer, len, keywords[i], strlen(keywords[i])))
+    for (int i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strstr(comm, keywords[i])) {
             return 1;
+        }
     }
     return 0;
 }
 
-// 检查线程名
-static int is_sensitive_comm(const char *comm)
-{
-    static const char *keywords[] = {
-        "gmain", "gum-js-loop", "gdbus",
-        "pool-frida", "linjector", "frida"
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
-        if (strstr(comm, keywords[i]))
-            return 1;
-    }
-    return 0;
-}
-
-// 检查路径是否敏感
-static int is_sensitive_path(const char *path)
-{
-    static const char *patterns[] = {
-        "frida", "gum", "linjector",
-        "/data/local/tmp/re.frida",
-        "/data/adb/modules/magisk-frida",
-        NULL
-    };
-    int i;
-
-    for (i = 0; patterns[i] != NULL; ++i) {
-        if (strstr(path, patterns[i]))
-            return 1;
-    }
-    return 0;
-}
-
-// ==========================================
-// Hook 实现
-// ==========================================
-
-// [1] Hook: show_map_vma
 static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 {
-    struct seq_file *m;
-
-    if (!is_target_process())
-        return;
-
-    m = (struct seq_file *)args->arg0;
-    if (!m)
-        return;
-
-    args->local.data0 = m->count;
+    struct seq_file *m = (struct seq_file *)args->arg0;
+    args->local.data0 = 0;
+    if (m && m->buf) {
+        // 记录 seq_file 中的count，在 after hook 中设置 count 为记录值
+        args->local.data0 = m->count;
+    } 
 }
 
 static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 {
-    struct seq_file *m;
-    size_t old_count, new_count, new_len;
-    char *new_content;
-
-    if (!is_target_process())
-        return;
-
-    m = (struct seq_file *)args->arg0;
-    if (!m || !m->buf)
-        return;
-
-    old_count = args->local.data0;
-    new_count = m->count;
-
-    if (new_count > old_count) {
-        new_content = m->buf + old_count;
-        new_len = new_count - old_count;
-
-        if (is_sensitive_content(new_content, new_len)) {
-            m->count = old_count;
-            atomic_inc(&stat_maps_hidden);
-            FH_LOGD("maps: hidden line (total: %d)\n", atomic_read(&stat_maps_hidden));
+    struct seq_file *m = (struct seq_file *)args->arg0;
+    if (m && m->buf) {
+        if (args->local.data0 && is_hiden_module(m)) {  // is_hiden_module 查找 frida-agent 等字符串
+            FH_LOGI("inject-hide: maps hide -> frida-agent\n");
+            m->count = args->local.data0;  // 恢复原来的 count 值
         }
     }
 }
 
-// [2] Hook: get_task_comm
-static void after_get_task_comm(hook_fargs3_t *args, void *udata)
+static void __attribute__((optimize("O0"))) after_get_task_comm(hook_fargs3_t *args, void *udata)
 {
-    char *comm;
-    const char *fake_names[] = {
-        "Binder", "RenderThread", "HeapTaskDaemon",
-        "FinalizerDaemon", "AsyncTask"
-    };
-    int idx;
-
-    if (!is_target_process())
-        return;
-
-    comm = (char *)args->arg0;
-    if (!comm)
-        return;
-
-    if (is_sensitive_comm(comm)) {
-        idx = (int)(args->arg1) % (sizeof(fake_names) / sizeof(fake_names[0]));
-        strncpy(comm, fake_names[idx], TASK_COMM_LEN - 1);
-        comm[TASK_COMM_LEN - 1] = '\0';
-
-        atomic_inc(&stat_comm_hidden);
-        FH_LOGD("comm: hidden -> %s (total: %d)\n",
-                comm, atomic_read(&stat_comm_hidden));
+    char *comm = (char *)args->arg0;
+    size_t comm_buf_len = (size_t)args->arg1;
+    if (comm && comm_buf_len) {
+        if (is_hiden_comm(comm)){
+            FH_LOGI("inject-hide: get_task_comm hide -> %s\n", comm);
+            size_t hide_len = strlen(comm);
+            for(size_t i = 0; i < hide_len; i++) {
+                comm[i] = ' ';
+            }
+        }
     }
 }
 
-// [3] Hook: connect
+// 网络协议中的端口号（大端）转换为主机字节序（小端）
+static inline uint16_t ntohs_u16(uint16_t port)
+{
+    return (uint16_t)((port >> 8) | (port << 8));
+}
 static void before_connect(hook_fargs3_t *args, void *udata)
 {
     struct sockaddr_in addr_kernel;
-    const void __user *addr_user;
-    uint16_t port;
-    char comm[TASK_COMM_LEN];
+    const char __user *addr = (const char __user *)(uintptr_t)syscall_argn(args, 1);
+    if (!addr) return;
 
-    addr_user = (const void __user *)(uintptr_t)syscall_argn(args, 1);
+    if (!__arch_copy_from_user) return;
+    if (__arch_copy_from_user(&addr_kernel, addr, sizeof(struct sockaddr_in)) != 0) return;
 
-    if (!addr_user || !__arch_copy_from_user)
-        return;
+    uint16_t port = ntohs_u16(addr_kernel.sin_port);
+    if (port == 27042) {
+        char comm[16];
+        if (!__get_task_comm) return;
+        __get_task_comm(comm, sizeof(comm), current);
 
-    if (__arch_copy_from_user(&addr_kernel, addr_user, sizeof(addr_kernel)) != 0)
-        return;
-
-    if (addr_kernel.sin_family != AF_INET)
-        return;
-
-    port = local_ntohs(addr_kernel.sin_port);
-
-    if (port == TARGET_PORT || port == 27042 || port == 27043) {
-        if (__get_task_comm) {
-            __get_task_comm(comm, sizeof(comm), current);
-            if (!strstr(comm, "adbd") && !strstr(comm, "sh")) {
-                atomic_inc(&stat_connect_blocked);
-                FH_LOGW("connect: BLOCKED port %d from %s (total: %d)\n",
-                        port, comm, atomic_read(&stat_connect_blocked));
-                args->skip_origin = 1;
-                args->ret = -ECONNREFUSED;
-            }
+        FH_LOGW("inject-hide: connect to frida-agent, comm: %s, port: %d\n", comm, port);
+        if (!strstr(comm, "adbd")) {  // 只允许 adbd 连接 frida
+            FH_LOGW("inject-hide: connect to frida-agent blocked, comm: %s, port: %d\n", comm, port);
+            args->skip_origin = 1;  // 跳过原始的 connect 函数
+            args->ret = -EPERM;  // 返回 -EPERM 表示拒绝连接
         }
     }
 }
-
-// [4] Hook: readlink 通用处理
-static void after_readlink_common(void *user_buf_ptr, uint64_t *ret_ptr)
-{
-    long ret, read_len;
-    char kbuf[512];
-    const char *fake_path;
-    size_t fake_len;
-
-    if (!is_target_process())
-        return;
-
-    ret = (long)(*ret_ptr);
-    if (ret <= 0 || !user_buf_ptr || !__arch_copy_from_user || !__arch_copy_to_user)
-        return;
-
-    read_len = min(ret, (long)(sizeof(kbuf) - 1));
-
-    if (__arch_copy_from_user(kbuf, user_buf_ptr, read_len) != 0)
-        return;
-
-    kbuf[read_len] = '\0';
-
-    if (is_sensitive_content(kbuf, read_len)) {
-        if (strstr(kbuf, "/memfd:")) {
-            fake_path = "/dev/ashmem/dalvik-main space";
-        } else if (strstr(kbuf, ".so")) {
-            fake_path = "/system/lib64/libc.so";
-        } else {
-            fake_path = "/dev/null";
-        }
-
-        fake_len = strlen(fake_path);
-        if (__arch_copy_to_user(user_buf_ptr, fake_path, fake_len) == 0) {
-            *ret_ptr = (uint64_t)fake_len;
-            atomic_inc(&stat_readlink_hidden);
-            FH_LOGD("readlink: %s -> %s (total: %d)\n",
-                    kbuf, fake_path, atomic_read(&stat_readlink_hidden));
-        }
-    }
-}
-
-static void after_readlinkat(hook_fargs4_t *args, void *udata)
-{
-    void *user_buf = (void *)syscall_argn(args, 2);
-    after_readlink_common(user_buf, &args->ret);
-}
-
-static void after_readlink(hook_fargs3_t *args, void *udata)
-{
-    void *user_buf = (void *)syscall_argn(args, 1);
-    after_readlink_common(user_buf, &args->ret);
-}
-
-// [5] Hook: openat
-static void before_openat(hook_fargs4_t *args, void *udata)
-{
-    const char __user *pathname_user;
-    char pathname[256];
-
-    if (!is_target_process())
-        return;
-
-    pathname_user = (const char __user *)(uintptr_t)syscall_argn(args, 1);
-    if (!pathname_user || !__arch_copy_from_user)
-        return;
-
-    if (__arch_copy_from_user(pathname, pathname_user, sizeof(pathname) - 1) != 0)
-        return;
-
-    pathname[sizeof(pathname) - 1] = '\0';
-
-    if (is_sensitive_path(pathname)) {
-        atomic_inc(&stat_openat_blocked);
-        FH_LOGD("openat: BLOCKED %s (total: %d)\n",
-                pathname, atomic_read(&stat_openat_blocked));
-        args->skip_origin = 1;
-        args->ret = -ENOENT;
-    }
-}
-
-// [6] Hook: getdents64
-static void after_getdents64(hook_fargs3_t *args, void *udata)
-{
-    long ret, pos, new_pos;
-    void __user *dirent_user;
-    char *kbuf;
-    int hidden_count;
-    struct linux_dirent64 *d;
-    int should_hide;
-
-    if (!is_target_process())
-        return;
-
-    ret = args->ret;
-    if (ret <= 0)
-        return;
-
-    dirent_user = (void __user *)(uintptr_t)syscall_argn(args, 1);
-    if (!dirent_user || !__arch_copy_from_user || !__arch_copy_to_user)
-        return;
-
-    kbuf = kmalloc(ret, GFP_KERNEL);
-    if (!kbuf)
-        return;
-
-    if (__arch_copy_from_user(kbuf, dirent_user, ret) != 0) {
-        kfree(kbuf);
-        return;
-    }
-
-    pos = 0;
-    new_pos = 0;
-    hidden_count = 0;
-
-    while (pos < ret) {
-        d = (struct linux_dirent64 *)(kbuf + pos);
-        should_hide = 0;
-
-        if (is_sensitive_content(d->d_name, strlen(d->d_name))) {
-            should_hide = 1;
-            hidden_count++;
-        }
-
-        if (!should_hide) {
-            if (new_pos != pos) {
-                memmove(kbuf + new_pos, kbuf + pos, d->d_reclen);
-            }
-            new_pos += d->d_reclen;
-        }
-
-        pos += d->d_reclen;
-    }
-
-    if (hidden_count > 0) {
-        __arch_copy_to_user(dirent_user, kbuf, new_pos);
-        args->ret = new_pos;
-        atomic_add(hidden_count, &stat_fd_hidden);
-        FH_LOGD("getdents64: hidden %d entries (total: %d)\n",
-                hidden_count, atomic_read(&stat_fd_hidden));
-    }
-
-    kfree(kbuf);
-}
-
-// ==========================================
-// 模块生命周期
-// ==========================================
 
 void frida_hide_install(void)
 {
-    FH_LOGI("Installing hooks (v%s)...\n", MYKPM_VERSION);
-
-    // 初始化函数指针
-    __arch_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
-    if (!__arch_copy_from_user)
-        __arch_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
-
-    __arch_copy_to_user = (void *)kallsyms_lookup_name("__arch_copy_to_user");
-    if (!__arch_copy_to_user)
-        __arch_copy_to_user = (void *)kallsyms_lookup_name("_copy_to_user");
-
-    __get_task_comm = (void *)kallsyms_lookup_name("__get_task_comm");
-    if (!__get_task_comm)
-        __get_task_comm = (void *)kallsyms_lookup_name("get_task_comm");
-
-    // 1. Hook show_map_vma
-    show_map_vma = (void *)kallsyms_lookup_name("show_map_vma");
+    FH_LOGI("inject-hide: install\n");
+    FH_BOOT("inject-hide: install\n");
+    show_map_vma = (void *) kallsyms_lookup_name("show_map_vma");
+    FH_LOGD("inject-hide: show_map_vma addr=0x%lx\n", (unsigned long)(uintptr_t)show_map_vma);
     if (show_map_vma) {
-        if (hook_wrap2(show_map_vma, before_show_map_vma, after_show_map_vma, NULL) == HOOK_NO_ERR) {
+        hook_err_t err = hook_wrap2(show_map_vma, before_show_map_vma, after_show_map_vma, NULL);
+        if (err == HOOK_NO_ERR) {
             show_map_vma_hook_status = 1;
-            FH_LOGI("+ show_map_vma hooked\n");
+            FH_LOGI("inject-hide: hook show_map_vma ok\n");
+            FH_BOOT("inject-hide: hook show_map_vma ok\n");
+        } else {
+            FH_LOGW("inject-hide: hook show_map_vma failed: %d\n", err);
+            FH_BOOT("inject-hide: hook show_map_vma failed: %d\n", err);
         }
+    } else {
+        FH_LOGW("inject-hide: kallsyms show_map_vma not found\n");
+        FH_BOOT("inject-hide: kallsyms show_map_vma not found\n");
     }
 
-    // 2. Hook get_task_comm
+    __get_task_comm = (void *) kallsyms_lookup_name("__get_task_comm");
+    if (!__get_task_comm) {
+        __get_task_comm = (void *)kallsyms_lookup_name("get_task_comm");
+    }
+    FH_LOGD("inject-hide: get_task_comm addr=0x%lx\n", (unsigned long)(uintptr_t)__get_task_comm);
     if (__get_task_comm) {
-        if (hook_wrap3(__get_task_comm, NULL, after_get_task_comm, NULL) == HOOK_NO_ERR) {
+        hook_err_t err = hook_wrap3(__get_task_comm, 0, after_get_task_comm, 0);
+        if (err == HOOK_NO_ERR) {
             get_task_comm_hook_status = 1;
-            FH_LOGI("+ get_task_comm hooked\n");
+            FH_LOGI("inject-hide: hook get_task_comm ok\n");
+            FH_BOOT("inject-hide: hook get_task_comm ok\n");
+        } else {
+            FH_LOGW("inject-hide: hook get_task_comm failed: %d\n", err);
+            FH_BOOT("inject-hide: hook get_task_comm failed: %d\n", err);
         }
+    } else {
+        FH_LOGW("inject-hide: kallsyms get_task_comm not found\n");
+        FH_BOOT("inject-hide: kallsyms get_task_comm not found\n");
     }
 
-    // 3. Hook connect
-    if (__arch_copy_from_user && __get_task_comm) {
-        if (fp_hook_syscalln(__NR_connect, 3, before_connect, NULL, NULL) == HOOK_NO_ERR) {
+    __arch_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
+    if (!__arch_copy_from_user) {
+        __arch_copy_from_user = (void *)kallsyms_lookup_name("copy_from_user");
+    }
+    FH_LOGD("inject-hide: copy_from_user addr=0x%lx\n", (unsigned long)(uintptr_t)__arch_copy_from_user);
+    if(__arch_copy_from_user && __get_task_comm) {
+        hook_err_t err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, NULL);
+        if (err == HOOK_NO_ERR) {
             connect_hook_status = 1;
-            FH_LOGI("+ connect hooked (port: %d)\n", TARGET_PORT);
+            FH_LOGI("inject-hide: hook connect syscall ok\n");
+            FH_BOOT("inject-hide: hook connect syscall ok\n");
+        } else {
+            FH_LOGW("inject-hide: hook connect syscall failed: %d\n", err);
+            FH_BOOT("inject-hide: hook connect syscall failed: %d\n", err);
         }
+    } else {
+        FH_LOGW("inject-hide: kallsyms copy_from_user not found\n");
+        FH_BOOT("inject-hide: kallsyms copy_from_user not found\n");
     }
-
-    // 4. Hook readlinkat & readlink
-    if (__arch_copy_from_user && __arch_copy_to_user) {
-        if (fp_hook_syscalln(__NR_readlinkat, 4, NULL, after_readlinkat, NULL) == HOOK_NO_ERR) {
-            readlinkat_hook_status = 1;
-            FH_LOGI("+ readlinkat hooked\n");
-        }
-        if (fp_hook_syscalln(__NR_readlink, 3, NULL, after_readlink, NULL) == HOOK_NO_ERR) {
-            readlink_hook_status = 1;
-            FH_LOGI("+ readlink hooked\n");
-        }
-    }
-
-    // 5. Hook openat
-    if (__arch_copy_from_user) {
-        if (fp_hook_syscalln(__NR_openat, 4, before_openat, NULL, NULL) == HOOK_NO_ERR) {
-            openat_hook_status = 1;
-            FH_LOGI("+ openat hooked\n");
-        }
-    }
-
-    // 6. Hook getdents64
-    if (__arch_copy_from_user && __arch_copy_to_user) {
-        if (fp_hook_syscalln(__NR_getdents64, 3, NULL, after_getdents64, NULL) == HOOK_NO_ERR) {
-            getdents64_hook_status = 1;
-            FH_LOGI("+ getdents64 hooked\n");
-        }
-    }
-
-        FH_LOGI("Installation complete. Active hooks: %d\n",
-            show_map_vma_hook_status + get_task_comm_hook_status +
-            connect_hook_status + readlinkat_hook_status +
-            readlink_hook_status + openat_hook_status + getdents64_hook_status);
 }
 
 void frida_hide_uninstall(void)
 {
-    FH_LOGI("Uninstalling hooks...\n");
-
-    if (show_map_vma_hook_status) {
+    FH_LOGI("inject-hide: uninstall\n");
+    FH_BOOT("inject-hide: uninstall\n");
+    if (show_map_vma && show_map_vma_hook_status) {
         unhook(show_map_vma);
+        show_map_vma = 0;
         show_map_vma_hook_status = 0;
     }
 
-    if (get_task_comm_hook_status) {
+    if (__get_task_comm && get_task_comm_hook_status) {
         unhook(__get_task_comm);
+        __get_task_comm = 0;
         get_task_comm_hook_status = 0;
     }
 
-    if (connect_hook_status) {
-        fp_unhook_syscalln(__NR_connect, before_connect, NULL);
+    if(connect_hook_status) {
+        fp_unhook_syscalln(__NR_connect, before_connect, 0);
         connect_hook_status = 0;
     }
-
-    if (readlinkat_hook_status) {
-        fp_unhook_syscalln(__NR_readlinkat, NULL, after_readlinkat);
-        readlinkat_hook_status = 0;
-    }
-
-    if (readlink_hook_status) {
-        fp_unhook_syscalln(__NR_readlink, NULL, after_readlink);
-        readlink_hook_status = 0;
-    }
-
-    if (openat_hook_status) {
-        fp_unhook_syscalln(__NR_openat, before_openat, NULL);
-        openat_hook_status = 0;
-    }
-
-    if (getdents64_hook_status) {
-        fp_unhook_syscalln(__NR_getdents64, NULL, after_getdents64);
-        getdents64_hook_status = 0;
-    }
-
-    FH_LOGI("Uninstall complete\n");
 }
 
 static long frida_hide_init(const char *args, const char *event, void *reserved)
 {
-    char *args_copy, *token, *cur;
-    int new_port;
-
-    FH_LOGI("FridaHide v%s initializing...\n", MYKPM_VERSION);
-
-    // 解析参数 (格式: "port=27042,package=com.example.app")
-    if (args && strlen(args) > 0) {
-        args_copy = kstrdup(args, GFP_KERNEL);
-        if (args_copy) {
-            cur = args_copy;
-            while ((token = strsep(&cur, ","))) {
-                if (strncmp(token, "port=", 5) == 0) {
-                    // 使用简单的字符串转整数
-                    if (parse_port_arg(token + 5, &new_port) == 0) {
-                        TARGET_PORT = new_port;
-                        FH_LOGI("Config: port=%d\n", TARGET_PORT);
-                    }
-                } else if (strncmp(token, "package=", 8) == 0) {
-                    strncpy(TARGET_PACKAGE, token + 8, sizeof(TARGET_PACKAGE) - 1);
-                    TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
-                    FH_LOGI("Config: package=%s\n", TARGET_PACKAGE);
-                } else if (strcmp(token, "verbose") == 0) {
-                    frida_hide_log_verbose = 1;
-                    FH_LOGI("Config: verbose logging enabled\n");
-                }
-            }
-            kfree(args_copy);
-        }
-    }
-
+    FH_LOGI("inject-hide: module init\n");
+    FH_BOOT("inject-hide: module init\n");
     if (frida_hide_enabled) {
         frida_hide_install();
+    } else {
+        FH_LOGI("inject-hide: start disabled\n");
+        FH_BOOT("inject-hide: start disabled\n");
     }
-
     return 0;
 }
 
 static long frida_hide_exit(void *reserved)
 {
-    FH_LOGI("FridaHide exiting...\n");
+    FH_LOGI("inject-hide: module exit\n");
+    FH_BOOT("inject-hide: module exit\n");
     frida_hide_uninstall();
-
-    // 打印统计信息
-    FH_LOGI("Statistics:\n");
-    FH_LOGI("  Maps hidden: %d\n", atomic_read(&stat_maps_hidden));
-    FH_LOGI("  Readlinks hidden: %d\n", atomic_read(&stat_readlink_hidden));
-    FH_LOGI("  Comms hidden: %d\n", atomic_read(&stat_comm_hidden));
-    FH_LOGI("  Connects blocked: %d\n", atomic_read(&stat_connect_blocked));
-    FH_LOGI("  Openats blocked: %d\n", atomic_read(&stat_openat_blocked));
-    FH_LOGI("  FDs hidden: %d\n", atomic_read(&stat_fd_hidden));
-
     return 0;
 }
 
 static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
 {
-    char reply_msg[512];
+    char reply_msg[256];
     int reply_len = 0;
-    int new_port;
 
     if (!args || !strncmp(args, "STATUS", 6)) {
-        // 状态查询
         reply_len = snprintf(reply_msg, sizeof(reply_msg),
-            "FridaHide v%s Status:\n"
-            "Enabled: %s\n"
-            "Target Package: %s\n"
-            "Target Port: %d\n"
-            "\nActive Hooks:\n"
-            "  show_map_vma: %s\n"
-            "  get_task_comm: %s\n"
-            "  connect: %s\n"
-            "  readlinkat: %s\n"
-            "  readlink: %s\n"
-            "  openat: %s\n"
-            "  getdents64: %s\n"
-            "\nStatistics:\n"
-            "  Maps hidden: %d\n"
-            "  Readlinks: %d\n"
-            "  Comms: %d\n"
-            "  Connects blocked: %d\n"
-            "  Openats blocked: %d\n"
-            "  FDs hidden: %d\n",
-            MYKPM_VERSION,
-            frida_hide_enabled ? "YES" : "NO",
-            TARGET_PACKAGE[0] ? TARGET_PACKAGE : "(all processes)",
-            TARGET_PORT,
-            show_map_vma_hook_status ? "+" : "-",
-            get_task_comm_hook_status ? "+" : "-",
-            connect_hook_status ? "+" : "-",
-            readlinkat_hook_status ? "+" : "-",
-            readlink_hook_status ? "+" : "-",
-            openat_hook_status ? "+" : "-",
-            getdents64_hook_status ? "+" : "-",
-            atomic_read(&stat_maps_hidden),
-            atomic_read(&stat_readlink_hidden),
-            atomic_read(&stat_comm_hidden),
-            atomic_read(&stat_connect_blocked),
-            atomic_read(&stat_openat_blocked),
-            atomic_read(&stat_fd_hidden)
-        );
-    }
-    else if (!strcmp(args, "ENABLE") || !strcmp(args, "EN")) {
+                             "enabled: %s\nlog: %s\nverbose: %s\nshow_map_vma: %d\nget_task_comm: %d\nconnect: %d\n",
+                             frida_hide_enabled ? "enabled" : "disabled",
+                             frida_hide_log_enabled ? "on" : "off",
+                             frida_hide_log_verbose ? "on" : "off",
+                             show_map_vma_hook_status, get_task_comm_hook_status, connect_hook_status);
+    } else if (!strcmp(args, "EN")) {
         if (!frida_hide_enabled) {
             frida_hide_enabled = 1;
             frida_hide_install();
         }
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "FridaHide enabled");
-    }
-    else if (!strcmp(args, "DISABLE") || !strcmp(args, "DIS")) {
+        reply_len = snprintf(reply_msg, sizeof(reply_msg), "enabled");
+    } else if (!strcmp(args, "DIS")) {
         if (frida_hide_enabled) {
             frida_hide_enabled = 0;
             frida_hide_uninstall();
         }
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "FridaHide disabled");
-    }
-    else if (!strncmp(args, "PORT=", 5)) {
-        if (parse_port_arg(args + 5, &new_port) == 0) {
-            TARGET_PORT = new_port;
-            reply_len = snprintf(reply_msg, sizeof(reply_msg),
-                                "Port updated to %d", TARGET_PORT);
-        } else {
-            reply_len = snprintf(reply_msg, sizeof(reply_msg), "Invalid port");
-        }
-    }
-    else if (!strncmp(args, "PACKAGE=", 8)) {
-        strncpy(TARGET_PACKAGE, args + 8, sizeof(TARGET_PACKAGE) - 1);
-        TARGET_PACKAGE[sizeof(TARGET_PACKAGE) - 1] = '\0';
+        reply_len = snprintf(reply_msg, sizeof(reply_msg), "disabled");
+    } else if (!strncmp(args, "LOG ", 4)) {
+        frida_hide_log_enabled = (args[4] != '0');
+        reply_len = snprintf(reply_msg, sizeof(reply_msg), "log: %s", frida_hide_log_enabled ? "on" : "off");
+    } else if (!strncmp(args, "LOGV ", 5)) {
+        frida_hide_log_verbose = (args[5] != '0');
+        reply_len = snprintf(reply_msg, sizeof(reply_msg), "verbose: %s", frida_hide_log_verbose ? "on" : "off");
+    } else {
         reply_len = snprintf(reply_msg, sizeof(reply_msg),
-                            "Package filter: %s", TARGET_PACKAGE);
-    }
-    else if (!strcmp(args, "VERBOSE")) {
-        frida_hide_log_verbose = !frida_hide_log_verbose;
-        reply_len = snprintf(reply_msg, sizeof(reply_msg),
-                            "Verbose logging: %s",
-                            frida_hide_log_verbose ? "ON" : "OFF");
-    }
-    else if (!strcmp(args, "RESET_STATS")) {
-        atomic_set(&stat_maps_hidden, 0);
-        atomic_set(&stat_readlink_hidden, 0);
-        atomic_set(&stat_comm_hidden, 0);
-        atomic_set(&stat_connect_blocked, 0);
-        atomic_set(&stat_openat_blocked, 0);
-        atomic_set(&stat_fd_hidden, 0);
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "Statistics reset");
-    }
-    else {
-        reply_len = snprintf(reply_msg, sizeof(reply_msg),
-            "Unknown command. Available:\n"
-            "  STATUS - Show status\n"
-            "  ENABLE/DISABLE - Toggle module\n"
-            "  PORT=<num> - Set target port\n"
-            "  PACKAGE=<name> - Set target package\n"
-            "  VERBOSE - Toggle verbose logging\n"
-            "  RESET_STATS - Reset counters\n");
+                             "Unknown command\nAvailable: STATUS | EN | DIS | LOG 0/1 | LOGV 0/1\n");
     }
 
     if (out_msg && outlen > 0 && reply_len > 0) {
-        if (__arch_copy_to_user) {
-            __arch_copy_to_user(out_msg, reply_msg, min(reply_len + 1, outlen));
+        int copy_len = min(reply_len + 1, outlen);
+        if (compat_copy_to_user(out_msg, reply_msg, copy_len) <= 0) {
+            FH_LOGW("inject-hide: failed to copy reply to user\n");
+            return -1;
         }
     }
 
