@@ -4,7 +4,6 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/err.h>
-#include <linux/cred.h>
 #include <uapi/asm-generic/errno.h>
 #include <hook.h>
 #include <ksyms.h>
@@ -24,8 +23,6 @@ KPM_DESCRIPTION("Hide Frida injection from detection");
 #define ECONNREFUSED 111
 
 // UID 常量
-#define UID_ROOT 0
-#define UID_SHELL 2000
 #define UID_APP_START 10000
 
 // ==================== 结构体定义 ====================
@@ -49,9 +46,6 @@ struct sockaddr_in {
 static uint64_t show_map_vma_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
 static uint64_t comm_write_addr = 0;
-
-// 内核函数指针
-static typeof(current_cred) *current_cred_func = 0;
 
 // ==================== 辅助函数 ====================
 
@@ -109,29 +103,11 @@ static inline uint16_t bswap16(uint16_t val)
     return (val >> 8) | (val << 8);
 }
 
-// 获取当前进程的 UID
-static int get_current_uid(void)
-{
-    if (!current_cred_func) {
-        return -1;
-    }
-    
-    const struct cred *cred = current_cred_func();
-    if (!cred) {
-        return -1;
-    }
-    
-    // cred->uid 是 kuid_t 结构，取其 val 字段
-    // 不同内核版本可能不同，这里直接读取第一个 int
-    return *(int *)(&cred->uid);
-}
-
-// 检查是否是需要隐藏的普通应用（UID >= 10000）
+// 检查是否是普通应用（UID >= 10000）
 static int is_app_process(void)
 {
-    int uid = get_current_uid();
-    // UID >= 10000 是普通应用
-    // UID 0 是 root，UID 2000 是 shell
+    // 使用 KernelPatch 提供的 current_uid() 函数
+    uid_t uid = current_uid();
     return (uid >= UID_APP_START);
 }
 
@@ -219,7 +195,6 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 }
 
 // 2. tcp_v4_connect hook - 只阻止普通应用连接 frida 端口
-// int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
 {
     struct sockaddr_in *addr = (struct sockaddr_in *)args->arg1;
@@ -240,12 +215,11 @@ static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
     // 关键：只阻止普通应用（UID >= 10000）
     // 允许 root (0) 和 shell (2000) 进程正常连接
     if (!is_app_process()) {
-        // root/shell 进程，允许连接
         return;
     }
     
     // 普通应用尝试连接 frida 端口，阻止
-    LOGV("blocked app (uid=%d) connect to frida port %d\n", get_current_uid(), port);
+    LOGV("blocked app (uid=%d) connect to port %d\n", current_uid(), port);
     args->ret = (uint64_t)(-(long)ECONNREFUSED);
     args->skip_origin = 1;
 }
@@ -286,7 +260,6 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
             const char *fake = "kworker\n";
             size_t fake_len = my_strlen(fake);
             
-            // 覆盖内容
             char *p = new_data;
             const char *f = fake;
             while (*f) {
@@ -294,7 +267,6 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
             }
             m->count = old_count + fake_len;
         } else if (saved) {
-            // 恢复
             new_data[new_len] = saved;
         }
     }
@@ -309,7 +281,6 @@ static void after_get_task_comm(hook_fargs3_t *args, void *udata)
         return;
     
     if (is_frida_thread_name(buf)) {
-        // 替换为普通线程名
         buf[0] = 'k';
         buf[1] = 'w';
         buf[2] = 'o';
@@ -328,14 +299,6 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     LOGV("loading, version: %s\n", MYKPM_VERSION);
     
     int hooks_installed = 0;
-    
-    // 获取 current_cred 函数指针
-    current_cred_func = (typeof(current_cred) *)kallsyms_lookup_name("current_cred");
-    if (!current_cred_func) {
-        LOGV("current_cred not found, will block all connections to frida ports\n");
-    } else {
-        LOGV("current_cred found at 0x%llx\n", (uint64_t)current_cred_func);
-    }
     
     // 1. Hook show_map_vma - 隐藏 maps
     show_map_vma_addr = kallsyms_lookup_name("show_map_vma");
@@ -390,7 +353,6 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     } else {
         LOGV("comm_show not found, trying __get_task_comm\n");
         
-        // 备选方案: hook __get_task_comm
         uint64_t get_task_comm_addr = kallsyms_lookup_name("__get_task_comm");
         if (!get_task_comm_addr) {
             get_task_comm_addr = kallsyms_lookup_name("get_task_comm");
