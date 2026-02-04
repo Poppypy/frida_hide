@@ -1,11 +1,19 @@
+#include <linux/kernel.h>
 
 #include <compiler.h>
 #include <kpmodule.h>
 #include <kputils.h>
 #include <linux/string.h>
+// KPM 元数据声明
+#include <linux/module.h>
+#include <linux/version.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+#include <linux/net.h>
+#include <linux/in.h>
 
 KPM_NAME("frida_hide");
-KPM_VERSION("1.0");
+KPM_VERSION(MYKPM_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Security Researcher");
 KPM_DESCRIPTION("Hide Frida injection from detection");
@@ -16,6 +24,7 @@ struct seq_file_compat {
     size_t size;
     size_t from;
     size_t count;
+    // 其他字段省略，我们只需要这些
 };
 
 struct sockaddr_in_compat {
