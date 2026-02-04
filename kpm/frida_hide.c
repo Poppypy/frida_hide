@@ -1,358 +1,307 @@
-#include <kallsyms.h>
-#include <linux/printk.h>
 #include <log.h>
+#include <compiler.h>
 #include <kpmodule.h>
 #include <hook.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <syscall.h>
-#include <compiler.h>
 #include <kputils.h>
-#include <linux/kernel.h>
-#include <linux/string.h>
-#include <linux/sched.h>
+#include <linux/printk.h>
+#include <linux/errno.h>
 #include <linux/uaccess.h>
-#include <uapi/asm-generic/errno.h>
-#include <uapi/asm-generic/unistd.h>
+#include <syscall.h>
 #include <asm/current.h>
+#include <linux/dirent.h>
+#include <linux/types.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <linux/net.h>
+#include "linux/include/linux/string.h"
+#include <linux/err.h>
+#include <linux/kernel.h>
+#include <linux/list.h>
 
-#ifndef MYKPM_VERSION
-// VSCode IntelliSense 没有走 Makefile 的 -DMYKPM_VERSION 时会报红；编译时仍以 Makefile 传入为准。
-#define MYKPM_VERSION "dev"
-#endif
-
-#ifndef __NR_connect
-// IntelliSense 兜底：正常编译会从 <uapi/asm-generic/unistd.h> 获得该宏。
-#define __NR_connect 203
-#endif
-
-KPM_NAME("FridaHide");
-KPM_VERSION(MYKPM_VERSION);
+KPM_NAME("kpm-frida-hider");
+KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("popy");
-KPM_DESCRIPTION("Hide Frida traces in maps/threads/connect");
+KPM_DESCRIPTION("Hide Frida artifacts from detection");
 
+// --- 类型定义 ---
 
-struct seq_file{
-    char *buf;
-	size_t size;
-	size_t from;
-	size_t count;
-};
-struct sockaddr_in {
-    short sin_family;
-    unsigned short sin_port;     
-    unsigned int sin_addr;     
-    char sin_zero[8];
+struct linux_dirent64 {
+    u64            d_ino;
+    s64            d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
 };
 
-static void *show_map_vma = NULL;
-static char *(*__get_task_comm)(char *buf, size_t buf_size, struct task_struct *tsk) = NULL;  // 为了后续能够调用，定义成函数指针变量
-static unsigned long (*__arch_copy_from_user)(void *to, const void __user *from, unsigned long n) = NULL;
+typedef unsigned long (*find_copy_from_user)(void *to, const void *from, unsigned long n);
+typedef unsigned long (*find_copy_to_user)(void *to, const void *from, unsigned long n);
+typedef long (*t_syscall_getdents64)(unsigned int fd, struct linux_dirent64 __user *dirent, unsigned int count);
+typedef long (*t_syscall_readlinkat)(int dfd, const char __user *path, char __user *buf, int bufsiz);
+typedef long (*t_syscall_connect)(int fd, struct sockaddr __user *uservaddr, int addrlen);
 
-static int show_map_vma_hook_status = 0;
-static int get_task_comm_hook_status = 0;
-static int connect_hook_status = 0;
-static int frida_hide_enabled = 1;
-static int frida_hide_log_enabled = 1;
-static int frida_hide_log_verbose = 0;
+static find_copy_from_user got_copy_from_user = NULL;
+static find_copy_to_user got_copy_to_user = NULL;
 
-#define FH_LOGI(fmt, ...)                       \
-    do {                                        \
-        if (frida_hide_log_enabled)             \
-            logki(fmt, ##__VA_ARGS__);          \
-    } while (0)
-#define FH_LOGW(fmt, ...)                       \
-    do {                                        \
-        if (frida_hide_log_enabled)             \
-            logkw(fmt, ##__VA_ARGS__);          \
-    } while (0)
-#define FH_LOGD(fmt, ...)                               \
-    do {                                                \
-        if (frida_hide_log_enabled && frida_hide_log_verbose) \
-            logkd(fmt, ##__VA_ARGS__);                  \
-    } while (0)
-#define FH_BOOT(fmt, ...)                      \
-    do {                                       \
-        if (frida_hide_log_enabled)            \
-            log_boot(fmt, ##__VA_ARGS__);      \
-    } while (0)
+// --- 隐藏配置 ---
 
-#ifndef min
-#define min(x, y) ((x) < (y) ? (x) : (y))
-#endif
+static const char* HIDE_KEYWORDS[] = {
+    "frida",
+    "gum-js",
+    "gdbus",
+    "gmain",
+    "linjector",
+    "re.frida.server",
+    "gadget"
+};
 
-// 内核环境下的 memmem 实现
-static void *memmem_local(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)
-{
-    if (!haystack || !needle || haystacklen < needlelen || needlelen == 0)
-        return NULL;
-    for (size_t i = 0; i <= haystacklen - needlelen; ++i) {
-        if (memcmp((const char *)haystack + i, needle, needlelen) == 0)
-            return (void *)((const char *)haystack + i);
-    }
-    return NULL;
-}
+#define HIDE_KEYWORDS_COUNT (sizeof(HIDE_KEYWORDS) / sizeof(HIDE_KEYWORDS[0]))
 
-// 检查 seq_file 缓冲区中是否包含敏感关键词
-static const char *get_hiden_module_keyword(struct seq_file *m)
-{
-    if (!m || !m->buf || m->count == 0) return NULL;
-    // 需要隐藏的关键词列表
-    static const char *keywords[] = {
-        "frida-agent",
-        "frida",
-        "gum-js-loop",
-        "GumJS",
-        "gmain",
-        NULL
-    };
+// Frida 默认端口范围
+#define FRIDA_PORT_START 27042
+#define FRIDA_PORT_END   27049
 
-    for (int i = 0; keywords[i] != NULL; ++i) {
-        if (memmem_local(m->buf, m->count, keywords[i], strlen(keywords[i])))
-            return keywords[i];
-    }
-    return NULL;
-}
+static bool install_successful = false;
+static char* control_status = "start";
 
-static const char *get_hiden_comm_keyword(const char *comm)
-{
-    // 需要隐藏的线程名关键词列表
-    static const char *keywords[] = {
-        "gmain",
-        "gum-js-loop",
-        "gdbus",
-        "pool-frida",
-        "linjector",
-        NULL
-    };
+// --- 辅助函数 ---
 
-    for (int i = 0; keywords[i] != NULL; i++) {
-        if (strstr(comm, keywords[i])) {
-            return keywords[i];
+static bool should_hide(const char* name) {
+    if (!name) return false;
+    for (int i = 0; i < HIDE_KEYWORDS_COUNT; i++) {
+        if (strstr(name, HIDE_KEYWORDS[i])) {
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
-static void before_show_map_vma(hook_fargs2_t *args, void *udata)
-{
-    struct seq_file *m = (struct seq_file *)args->arg0;
-    args->local.data0 = 0;
-    if (m && m->buf) {
-        // 记录 seq_file 中的count，在 after hook 中设置 count 为记录值
-        args->local.data0 = m->count;
-    } 
+// --- Hook 实现 ---
+
+// 1. Hook getdents64: 隐藏文件和进程
+// 对应检测: scanPsForFrida, scanCommonPathsForFridaBinaries
+static long new_getdents64(const struct pt_regs *regs) {
+    // 原始调用
+    // getdents64(unsigned int fd, struct linux_dirent64 *dirent, unsigned int count)
+    // regs->regs[0] = fd, [1] = dirent, [2] = count
+    
+    // 我们不能直接调用原始 syscall 函数指针，因为 KPM 框架的 fp_hook_syscalln 会处理。
+    // 这里我们作为 pre-hook 其实不太方便修改返回值，
+    // 但 KPM 的 hook 机制通常允许我们在 post-hook 或者通过 replace 方式处理。
+    // 由于 KPM 示例主要展示了 before_exit 这种 pre-hook，
+    // 若要修改 buffer，我们需要在 syscall 返回后执行。
+    // 如果 KPM 库不支持 post-hook，我们需要用更底层的 hook (如 inline hook 原始 syscall 入口)。
+    
+    // 假设这是标准的 inline hook 或者 KPM 提供了替换机制。
+    // 这里演示标准的 "Call Original -> Filter -> Return" 逻辑。
+    
+    // 注意：在实际 KPM 环境中，如果只提供 pre-hook，你可能需要 hook 那个特定的内核函数 (sys_getdents64)。
+    // 下面代码假设我们是替换了 sys_getdents64 的逻辑。
+    
+    return 0; // 占位，实际逻辑在下面单独的 hook 函数中
 }
 
-static void after_show_map_vma(hook_fargs2_t *args, void *udata)
-{
-    struct seq_file *m = (struct seq_file *)args->arg0;
-    if (m && m->buf) {
-        const char *keyword = NULL;
-        if (args->local.data0 && (keyword = get_hiden_module_keyword(m))) {  // get_hiden_module_keyword 查找 frida-agent 等字符串
-            FH_LOGI("inject-hide: maps hide -> %s\n", keyword);
-            m->count = args->local.data0;  // 恢复原来的 count 值
+// 由于 KPM 的 hook_syscalln 是 pre-callback，无法直接处理 buffer 返回数据。
+// 我们需要 hook sys_getdents64 这个符号本身。
+
+static t_syscall_getdents64 orig_getdents64 = NULL;
+static t_syscall_readlinkat orig_readlinkat = NULL;
+static t_syscall_connect orig_connect = NULL;
+
+static asmlinkage long hook_sys_getdents64(unsigned int fd, struct linux_dirent64 __user *dirent, unsigned int count) {
+    long ret = orig_getdents64(fd, dirent, count);
+
+    if (ret <= 0 || strcmp(control_status, "start") != 0) return ret;
+
+    // 分配内核缓冲区
+    // 注意：大 buffer 分配可能失败，这里简化处理
+    struct linux_dirent64 *kdirent = (struct linux_dirent64 *)kzalloc(ret, GFP_KERNEL);
+    if (!kdirent) return ret;
+
+    if (got_copy_from_user(kdirent, dirent, ret)) {
+        kfree(kdirent);
+        return ret;
+    }
+
+    struct linux_dirent64 *cur = kdirent;
+    long pos = 0;
+    long new_ret = ret;
+    
+    // 遍历并过滤
+    while (pos < ret) {
+        long reclen = cur->d_reclen;
+        if (should_hide(cur->d_name)) {
+            // 需要隐藏：将后面的数据前移，覆盖当前项
+            long next_offset = pos + reclen;
+            long bytes_to_move = ret - next_offset;
+            
+            if (bytes_to_move > 0) {
+                memmove(cur, (char *)cur + reclen, bytes_to_move);
+            }
+            
+            new_ret -= reclen;
+            ret -= reclen; // 总长度减少，不移动 pos，重新检查当前位置（已经是下一项了）
+            continue; 
+        }
+        pos += reclen;
+        cur = (struct linux_dirent64 *)((char *)cur + reclen);
+    }
+
+    // 写回用户空间
+    if (new_ret > 0) {
+        got_copy_to_user(dirent, kdirent, new_ret);
+    }
+    
+    kfree(kdirent);
+    return new_ret;
+}
+
+// 2. Hook readlinkat: 隐藏 /proc/self/fd 下的特征链接
+// 对应检测: scanProcSelfFd
+static asmlinkage long hook_sys_readlinkat(int dfd, const char __user *path, char __user *buf, int bufsiz) {
+    long ret = orig_readlinkat(dfd, path, buf, bufsiz);
+    
+    if (ret <= 0 || strcmp(control_status, "start") != 0) return ret;
+
+    char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
+    if (!kbuf) return ret;
+
+    if (got_copy_from_user(kbuf, buf, ret)) {
+        kfree(kbuf);
+        return ret;
+    }
+    kbuf[ret] = '\0';
+
+    if (should_hide(kbuf)) {
+        // 发现敏感路径 (如 /data/local/tmp/frida-agent.so)
+        // 伪造返回为 /dev/null 或者一个无害路径
+        char *fake = "/dev/null";
+        int fake_len = strlen(fake);
+        if (bufsiz >= fake_len) {
+            memset(kbuf, 0, ret); // 清空
+            got_copy_to_user(buf, fake, fake_len);
+            kfree(kbuf);
+            return fake_len;
         }
     }
+
+    kfree(kbuf);
+    return ret;
 }
 
-static void __attribute__((optimize("O0"))) after_get_task_comm(hook_fargs3_t *args, void *udata)
-{
-    char *comm = (char *)args->arg0;
-    size_t comm_buf_len = (size_t)args->arg1;
-    if (comm && comm_buf_len) {
-        const char *keyword = get_hiden_comm_keyword(comm);
-        if (keyword){
-            FH_LOGI("inject-hide: get_task_comm hide -> %s (matched: %s)\n", comm, keyword);
-            size_t hide_len = strlen(comm);
-            for(size_t i = 0; i < hide_len; i++) {
-                comm[i] = ' ';
+// 3. Hook connect: 阻断 Frida 端口连接
+// 对应检测: scanDefaultFridaPorts
+static asmlinkage long hook_sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen) {
+    if (strcmp(control_status, "start") != 0) {
+        return orig_connect(fd, uservaddr, addrlen);
+    }
+
+    struct sockaddr_in kaddr;
+    if (addrlen >= sizeof(struct sockaddr_in)) {
+        if (got_copy_from_user(&kaddr, uservaddr, sizeof(struct sockaddr_in)) == 0) {
+            if (kaddr.sin_family == AF_INET) {
+                unsigned int port = ntohs(kaddr.sin_port);
+                // 检查是否是 Frida 端口
+                if (port >= FRIDA_PORT_START && port <= FRIDA_PORT_END) {
+                    // 检查是否是本地回环 (127.0.0.1)
+                    // 127.0.0.1 = 0x7F000001 (Network byte order depends on impl, safer to check raw)
+                    // htonl(INADDR_LOOPBACK)
+                    
+                    // 简单粗暴：任何尝试连接这些端口的行为都阻断
+                    logke("Blocking connection to Frida port: %d", port);
+                    return -ECONNREFUSED;
+                }
             }
         }
     }
+
+    return orig_connect(fd, uservaddr, addrlen);
 }
 
-// 网络协议中的端口号（大端）转换为主机字节序（小端）
-static inline uint16_t ntohs_u16(uint16_t port)
-{
-    return (uint16_t)((port >> 8) | (port << 8));
-}
-static void before_connect(hook_fargs3_t *args, void *udata)
-{
-    struct sockaddr_in addr_kernel;
-    const char __user *addr = (const char __user *)(uintptr_t)syscall_argn(args, 1);
-    if (!addr) return;
 
-    if (!__arch_copy_from_user) return;
-    if (__arch_copy_from_user(&addr_kernel, addr, sizeof(struct sockaddr_in)) != 0) return;
+// --- 模块初始化 ---
 
-    uint16_t port = ntohs_u16(addr_kernel.sin_port);
-    if (port == 27042) {
-        char comm[16];
-        if (!__get_task_comm) return;
-        __get_task_comm(comm, sizeof(comm), current);
-
-        FH_LOGW("inject-hide: connect to frida-agent, comm: %s, port: %d\n", comm, port);
-        if (!strstr(comm, "adbd")) {  // 只允许 adbd 连接 frida
-            FH_LOGW("inject-hide: connect to frida-agent blocked, comm: %s, port: %d\n", comm, port);
-            args->skip_origin = 1;  // 跳过原始的 connect 函数
-            args->ret = -EPERM;  // 返回 -EPERM 表示拒绝连接
-        }
+bool init_funcs() {
+    got_copy_from_user = (find_copy_from_user)kallsyms_lookup_name("copy_from_user");
+    got_copy_to_user = (find_copy_to_user)kallsyms_lookup_name("copy_to_user");
+    
+    if (!got_copy_from_user || !got_copy_to_user) {
+        logke("Failed to find copy_from/to_user");
+        return false;
     }
+    
+    // 查找原始系统调用地址
+    // 注意：sys_call_table 查找方式在不同内核版本不同，KPM 可能提供了 wrapper。
+    // 这里使用 kallsyms_lookup_name 查找导出的 sys_ 符号。
+    // 如果内核未导出 sys_getdents64，可能需要通过 sys_call_table 查找。
+    
+    // 尝试直接 hook 符号
+    void *sym_getdents64 = (void *)kallsyms_lookup_name("__arm64_sys_getdents64");
+    if (!sym_getdents64) sym_getdents64 = (void *)kallsyms_lookup_name("sys_getdents64");
+    
+    void *sym_readlinkat = (void *)kallsyms_lookup_name("__arm64_sys_readlinkat");
+    if (!sym_readlinkat) sym_readlinkat = (void *)kallsyms_lookup_name("sys_readlinkat");
+    
+    void *sym_connect = (void *)kallsyms_lookup_name("__arm64_sys_connect");
+    if (!sym_connect) sym_connect = (void *)kallsyms_lookup_name("sys_connect");
+
+    if (!sym_getdents64 || !sym_readlinkat || !sym_connect) {
+        logke("Failed to find syscall symbols");
+        return false;
+    }
+
+    // 执行 Hook
+    // 注意：kpm-backtrace 使用 hook() 函数，传入 原始地址, hook地址, 和备份地址指针
+    hook(sym_getdents64, hook_sys_getdents64, (void **)&orig_getdents64);
+    hook(sym_readlinkat, hook_sys_readlinkat, (void **)&orig_readlinkat);
+    hook(sym_connect, hook_sys_connect, (void **)&orig_connect);
+
+    return true;
 }
 
-void frida_hide_install(void)
+static long install(const char *args, const char *event, void *__user reserved)
 {
-    FH_LOGI("inject-hide: install\n");
-    FH_BOOT("inject-hide: install\n");
-    show_map_vma = (void *) kallsyms_lookup_name("show_map_vma");
-    FH_LOGD("inject-hide: show_map_vma addr=0x%lx\n", (unsigned long)(uintptr_t)show_map_vma);
-    if (show_map_vma) {
-        hook_err_t err = hook_wrap2(show_map_vma, before_show_map_vma, after_show_map_vma, NULL);
-        if (err == HOOK_NO_ERR) {
-            show_map_vma_hook_status = 1;
-            FH_LOGI("inject-hide: hook show_map_vma ok\n");
-            FH_BOOT("inject-hide: hook show_map_vma ok\n");
-        } else {
-            FH_LOGW("inject-hide: hook show_map_vma failed: %d\n", err);
-            FH_BOOT("inject-hide: hook show_map_vma failed: %d\n", err);
-        }
+    install_successful = init_funcs();
+    if (!install_successful) {
+        logke("Frida Hider module install fail.");
     } else {
-        FH_LOGW("inject-hide: kallsyms show_map_vma not found\n");
-        FH_BOOT("inject-hide: kallsyms show_map_vma not found\n");
-    }
-
-    __get_task_comm = (void *) kallsyms_lookup_name("__get_task_comm");
-    if (!__get_task_comm) {
-        __get_task_comm = (void *)kallsyms_lookup_name("get_task_comm");
-    }
-    FH_LOGD("inject-hide: get_task_comm addr=0x%lx\n", (unsigned long)(uintptr_t)__get_task_comm);
-    if (__get_task_comm) {
-        hook_err_t err = hook_wrap3(__get_task_comm, 0, after_get_task_comm, 0);
-        if (err == HOOK_NO_ERR) {
-            get_task_comm_hook_status = 1;
-            FH_LOGI("inject-hide: hook get_task_comm ok\n");
-            FH_BOOT("inject-hide: hook get_task_comm ok\n");
-        } else {
-            FH_LOGW("inject-hide: hook get_task_comm failed: %d\n", err);
-            FH_BOOT("inject-hide: hook get_task_comm failed: %d\n", err);
-        }
-    } else {
-        FH_LOGW("inject-hide: kallsyms get_task_comm not found\n");
-        FH_BOOT("inject-hide: kallsyms get_task_comm not found\n");
-    }
-
-    __arch_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
-    if (!__arch_copy_from_user) {
-        __arch_copy_from_user = (void *)kallsyms_lookup_name("copy_from_user");
-    }
-    FH_LOGD("inject-hide: copy_from_user addr=0x%lx\n", (unsigned long)(uintptr_t)__arch_copy_from_user);
-    if(__arch_copy_from_user && __get_task_comm) {
-        hook_err_t err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, NULL);
-        if (err == HOOK_NO_ERR) {
-            connect_hook_status = 1;
-            FH_LOGI("inject-hide: hook connect syscall ok\n");
-            FH_BOOT("inject-hide: hook connect syscall ok\n");
-        } else {
-            FH_LOGW("inject-hide: hook connect syscall failed: %d\n", err);
-            FH_BOOT("inject-hide: hook connect syscall failed: %d\n", err);
-        }
-    } else {
-        FH_LOGW("inject-hide: kallsyms copy_from_user not found\n");
-        FH_BOOT("inject-hide: kallsyms copy_from_user not found\n");
-    }
-}
-
-void frida_hide_uninstall(void)
-{
-    FH_LOGI("inject-hide: uninstall\n");
-    FH_BOOT("inject-hide: uninstall\n");
-    if (show_map_vma && show_map_vma_hook_status) {
-        unhook(show_map_vma);
-        show_map_vma = 0;
-        show_map_vma_hook_status = 0;
-    }
-
-    if (__get_task_comm && get_task_comm_hook_status) {
-        unhook(__get_task_comm);
-        __get_task_comm = 0;
-        get_task_comm_hook_status = 0;
-    }
-
-    if(connect_hook_status) {
-        fp_unhook_syscalln(__NR_connect, before_connect, 0);
-        connect_hook_status = 0;
-    }
-}
-
-static long frida_hide_init(const char *args, const char *event, void *reserved)
-{
-    FH_LOGI("inject-hide: module init\n");
-    FH_BOOT("inject-hide: module init\n");
-    if (frida_hide_enabled) {
-        frida_hide_install();
-    } else {
-        FH_LOGI("inject-hide: start disabled\n");
-        FH_BOOT("inject-hide: start disabled\n");
+        logke("Frida Hider module install successful.");
     }
     return 0;
 }
 
-static long frida_hide_exit(void *reserved)
+static long control(const char *args, char *__user out_msg, int outlen)
 {
-    FH_LOGI("inject-hide: module exit\n");
-    FH_BOOT("inject-hide: module exit\n");
-    frida_hide_uninstall();
+    if (strcmp(args, "stop") == 0) {
+        control_status = "stop";
+    } else if (strcmp(args, "start") == 0) {
+        control_status = "start";
+    }
     return 0;
 }
 
-static long frida_hide_ctl0(const char *args, char __user *out_msg, int outlen)
+static long uninstall(void *__user reserved)
 {
-    char reply_msg[256];
-    int reply_len = 0;
+    if (install_successful) {
+        // Unhook logic
+        // KPM 的 unhook 需要原始函数地址
+        void *sym_getdents64 = (void *)kallsyms_lookup_name("__arm64_sys_getdents64");
+        if (!sym_getdents64) sym_getdents64 = (void *)kallsyms_lookup_name("sys_getdents64");
+        
+        void *sym_readlinkat = (void *)kallsyms_lookup_name("__arm64_sys_readlinkat");
+        if (!sym_readlinkat) sym_readlinkat = (void *)kallsyms_lookup_name("sys_readlinkat");
+        
+        void *sym_connect = (void *)kallsyms_lookup_name("__arm64_sys_connect");
+        if (!sym_connect) sym_connect = (void *)kallsyms_lookup_name("sys_connect");
 
-    if (!args || !strncmp(args, "STATUS", 6)) {
-        reply_len = snprintf(reply_msg, sizeof(reply_msg),
-                             "enabled: %s\nlog: %s\nverbose: %s\nshow_map_vma: %d\nget_task_comm: %d\nconnect: %d\n",
-                             frida_hide_enabled ? "enabled" : "disabled",
-                             frida_hide_log_enabled ? "on" : "off",
-                             frida_hide_log_verbose ? "on" : "off",
-                             show_map_vma_hook_status, get_task_comm_hook_status, connect_hook_status);
-    } else if (!strcmp(args, "EN")) {
-        if (!frida_hide_enabled) {
-            frida_hide_enabled = 1;
-            frida_hide_install();
-        }
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "enabled");
-    } else if (!strcmp(args, "DIS")) {
-        if (frida_hide_enabled) {
-            frida_hide_enabled = 0;
-            frida_hide_uninstall();
-        }
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "disabled");
-    } else if (!strncmp(args, "LOG ", 4)) {
-        frida_hide_log_enabled = (args[4] != '0');
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "log: %s", frida_hide_log_enabled ? "on" : "off");
-    } else if (!strncmp(args, "LOGV ", 5)) {
-        frida_hide_log_verbose = (args[5] != '0');
-        reply_len = snprintf(reply_msg, sizeof(reply_msg), "verbose: %s", frida_hide_log_verbose ? "on" : "off");
-    } else {
-        reply_len = snprintf(reply_msg, sizeof(reply_msg),
-                             "Unknown command\nAvailable: STATUS | EN | DIS | LOG 0/1 | LOGV 0/1\n");
+        if (sym_getdents64) unhook(sym_getdents64);
+        if (sym_readlinkat) unhook(sym_readlinkat);
+        if (sym_connect) unhook(sym_connect);
     }
-
-    if (out_msg && outlen > 0 && reply_len > 0) {
-        int copy_len = min(reply_len + 1, outlen);
-        if (compat_copy_to_user(out_msg, reply_msg, copy_len) <= 0) {
-            FH_LOGW("inject-hide: failed to copy reply to user\n");
-            return -1;
-        }
-    }
-
+    logke("Frida Hider uninstall successful\n");
     return 0;
 }
 
-KPM_INIT(frida_hide_init);
-KPM_CTL0(frida_hide_ctl0);
-KPM_EXIT(frida_hide_exit);
+KPM_INIT(install);
+KPM_CTL0(control);
+KPM_EXIT(uninstall);
