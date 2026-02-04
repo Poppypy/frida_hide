@@ -46,9 +46,11 @@ struct sockaddr_in {
 
 typedef void *(*kmalloc_t)(size_t size, unsigned int flags);
 typedef void (*kfree_t)(const void *objp);
+typedef long (*copy_from_user_t)(void *to, const void __user *from, long n);
 
 static kmalloc_t kfunc_kmalloc = NULL;
 static kfree_t kfunc_kfree = NULL;
+static copy_from_user_t kfunc_copy_from_user = NULL;
 
 static const char *HIDE_KEYWORDS[] = {
     "frida", "gum-js", "gdbus", "gmain", "linjector",
@@ -87,12 +89,12 @@ static void after_getdents64(hook_fargs3_t *args, void *udata) {
     if (ret <= 0) return;
     
     struct linux_dirent64 __user *dirent = (struct linux_dirent64 __user *)syscall_argn(args, 1);
-    if (!dirent || !kfunc_kmalloc || !kfunc_kfree) return;
+    if (!dirent || !kfunc_kmalloc || !kfunc_kfree || !kfunc_copy_from_user) return;
     
     struct linux_dirent64 *kdirent = my_kzalloc(ret, GFP_KERNEL);
     if (!kdirent) return;
     
-    if (compat_copy_from_user(kdirent, dirent, ret)) {
+    if (kfunc_copy_from_user(kdirent, dirent, ret)) {
         kfunc_kfree(kdirent);
         return;
     }
@@ -130,16 +132,15 @@ static void before_readlinkat(hook_fargs4_t *args, void *udata) {
 static void after_readlinkat(hook_fargs4_t *args, void *udata) {
     if (!hook_enabled) return;
     long ret = (long)args->ret;
-    if (ret <= 0 || !kfunc_kmalloc || !kfunc_kfree) return;
+    if (ret <= 0 || !kfunc_kmalloc || !kfunc_kfree || !kfunc_copy_from_user) return;
     
     char __user *buf = (char __user *)syscall_argn(args, 2);
-    int bufsiz = (int)syscall_argn(args, 3);
     if (!buf) return;
     
     char *kbuf = my_kzalloc(ret + 1, GFP_KERNEL);
     if (!kbuf) return;
     
-    if (compat_copy_from_user(kbuf, buf, ret)) {
+    if (kfunc_copy_from_user(kbuf, buf, ret)) {
         kfunc_kfree(kbuf);
         return;
     }
@@ -153,16 +154,16 @@ static void after_readlinkat(hook_fargs4_t *args, void *udata) {
 }
 
 static void before_connect(hook_fargs3_t *args, void *udata) {
-    if (!hook_enabled) return;
+    if (!hook_enabled || !kfunc_copy_from_user) return;
     
     int addrlen = (int)syscall_argn(args, 2);
-    if (addrlen < sizeof(struct sockaddr_in)) return;
+    if (addrlen < (int)sizeof(struct sockaddr_in)) return;
     
     void __user *uservaddr = (void __user *)syscall_argn(args, 1);
     if (!uservaddr) return;
     
     struct sockaddr_in kaddr;
-    if (compat_copy_from_user(&kaddr, uservaddr, sizeof(kaddr))) return;
+    if (kfunc_copy_from_user(&kaddr, uservaddr, sizeof(kaddr))) return;
     
     if (kaddr.sin_family == AF_INET) {
         unsigned int port = my_ntohs(kaddr.sin_port);
@@ -174,7 +175,8 @@ static void before_connect(hook_fargs3_t *args, void *udata) {
     }
 }
 
-static void after_connect(hook_fargs3_t *args, void *udata) {}
+static void after_connect(hook_fargs3_t *args, void *udata) {
+}
 
 static long frida_hide_init(const char *args, const char *event, void *__user reserved) {
     pr_info("frida-hide: initializing...\n");
@@ -182,9 +184,11 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     kfunc_kmalloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     if (!kfunc_kmalloc) kfunc_kmalloc = (kmalloc_t)kallsyms_lookup_name("kmalloc");
     kfunc_kfree = (kfree_t)kallsyms_lookup_name("kfree");
+    kfunc_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    if (!kfunc_copy_from_user) kfunc_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
     
-    if (!kfunc_kmalloc || !kfunc_kfree) {
-        pr_err("frida-hide: failed to find kmalloc/kfree\n");
+    if (!kfunc_kmalloc || !kfunc_kfree || !kfunc_copy_from_user) {
+        pr_err("frida-hide: failed to find kernel functions\n");
         return -1;
     }
     
@@ -225,9 +229,9 @@ static long frida_hide_control(const char *args, char *__user out_msg, int outle
 static long frida_hide_exit(void *__user reserved) {
     pr_info("frida-hide: unloading...\n");
     
-    inline_unhook_syscall(__NR_getdents64, before_getdents64, after_getdents64);
-    inline_unhook_syscall(__NR_readlinkat, before_readlinkat, after_readlinkat);
-    inline_unhook_syscall(__NR_connect, before_connect, after_connect);
+    inline_unhook_syscalln(__NR_getdents64, before_getdents64, after_getdents64);
+    inline_unhook_syscalln(__NR_readlinkat, before_readlinkat, after_readlinkat);
+    inline_unhook_syscalln(__NR_connect, before_connect, after_connect);
     
     pr_info("frida-hide: unloaded\n");
     return 0;
