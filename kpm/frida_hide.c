@@ -1,19 +1,16 @@
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/version.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
-#include <linux/net.h>
-#include <linux/in.h>
 
-// KPM 元数据声明
+#include <compiler.h>
+#include <kpmodule.h>
+#include <kputils.h>
+#include <linux/string.h>
+
 KPM_NAME("frida_hide");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Security Researcher");
-KPM_DESCRIPTION("Hide Frida injection from detection by hooking kernel functions");
-
-// 结构体定义
+KPM_DESCRIPTION("Hide Frida injection from detection");
+// ==================== 结构体定义 ====================
+// 手动定义 seq_file 结构体（避免依赖内核头文件）
 struct seq_file_compat {
     char *buf;
     size_t size;
