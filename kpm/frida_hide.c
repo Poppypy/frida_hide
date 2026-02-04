@@ -1,19 +1,9 @@
-#include <linux/kernel.h>
-
 #include <compiler.h>
 #include <kpmodule.h>
 #include <kputils.h>
 #include <linux/string.h>
-// KPM 元数据声明
-#include <linux/module.h>
-#include <linux/version.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
-#include <linux/net.h>
-#include <linux/in.h>
-
 KPM_NAME("frida_hide");
-KPM_VERSION(MYKPM_VERSION);
+KPM_VERSION("1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Security Researcher");
 KPM_DESCRIPTION("Hide Frida injection from detection");
