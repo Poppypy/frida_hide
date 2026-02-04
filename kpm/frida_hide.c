@@ -1,7 +1,21 @@
+#include <log.h>
 #include <compiler.h>
 #include <kpmodule.h>
+#include <hook.h>
 #include <kputils.h>
-#include <linux/string.h>
+#include <linux/printk.h>
+#include <linux/errno.h>
+#include <linux/uaccess.h>
+#include <syscall.h>
+#include <asm/current.h>
+#include <asm/ptrace.h>
+#include "linux/include/linux/string.h"
+#include <linux/err.h>
+#include "linux/arch/arm64/include/asm/processor.h"
+#include "linux/include/linux/sched.h"
+#include "linux/include/linux/mm_types.h"
+#include <linux/kernel.h>
+
 KPM_NAME("frida_hide");
 KPM_VERSION("1.0");
 KPM_LICENSE("GPL v2");
