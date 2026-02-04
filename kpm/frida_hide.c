@@ -12,7 +12,7 @@ KPM_NAME("frida_hide");
 KPM_VERSION(MYKPM_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Security Researcher");
-KPM_DESCRIPTION("Hide Frida injection from detection - Full Version");
+KPM_DESCRIPTION("Hide Frida injection from detection - Enhanced");
 
 // ==================== 常量定义 ====================
 #define FRIDA_PORT_START 27042
@@ -21,7 +21,6 @@ KPM_DESCRIPTION("Hide Frida injection from detection - Full Version");
 
 #define AF_INET 2
 #define ECONNREFUSED 111
-#define ENOENT 2
 #define UID_APP_START 10000
 
 // ==================== 结构体定义 ====================
@@ -43,14 +42,6 @@ struct sockaddr_in {
     char sin_zero[8];
 };
 
-// vm_area_struct 简化定义
-struct vm_area_struct_partial {
-    unsigned long vm_start;
-    unsigned long vm_end;
-    unsigned long vm_flags;
-    // ... 其他字段
-};
-
 // ==================== 全局变量 ====================
 
 static uint64_t show_map_vma_addr = 0;
@@ -58,9 +49,7 @@ static uint64_t show_smap_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
 static uint64_t comm_write_addr = 0;
 static uint64_t proc_pid_readlink_addr = 0;
-static uint64_t do_readlinkat_addr = 0;
-static uint64_t seq_read_addr = 0;
-static uint64_t vfs_read_addr = 0;
+static uint64_t vma_get_file_addr = 0;
 
 // ==================== 辅助函数 ====================
 
@@ -113,13 +102,6 @@ static void *my_memmem(const void *haystack, size_t haystacklen,
     return 0;
 }
 
-static void my_memcpy(void *dst, const void *src, size_t n)
-{
-    char *d = dst;
-    const char *s = src;
-    while (n--) *d++ = *s++;
-}
-
 static int my_memcmp(const void *s1, const void *s2, size_t n)
 {
     const unsigned char *p1 = s1, *p2 = s2;
@@ -131,10 +113,11 @@ static int my_memcmp(const void *s1, const void *s2, size_t n)
     return 0;
 }
 
-static char my_tolower(char c)
+static void my_memcpy(void *dst, const void *src, size_t n)
 {
-    if (c >= 'A' && c <= 'Z') return c + 32;
-    return c;
+    char *d = dst;
+    const char *s = src;
+    while (n--) *d++ = *s++;
 }
 
 static inline uint16_t bswap16(uint16_t val) 
@@ -148,32 +131,6 @@ static int is_app_process(void)
     return (uid >= UID_APP_START);
 }
 
-// 不区分大小写的子串搜索
-static char *my_strcasestr(const char *haystack, const char *needle)
-{
-    if (!haystack || !needle) return 0;
-    if (!*needle) return (char *)haystack;
-    
-    size_t needle_len = my_strlen(needle);
-    
-    while (*haystack) {
-        int match = 1;
-        for (size_t i = 0; i < needle_len; i++) {
-            if (!haystack[i]) {
-                match = 0;
-                break;
-            }
-            if (my_tolower(haystack[i]) != my_tolower(needle[i])) {
-                match = 0;
-                break;
-            }
-        }
-        if (match) return (char *)haystack;
-        haystack++;
-    }
-    return 0;
-}
-
 static int is_frida_thread_name(const char *name)
 {
     if (!name || !*name) return 0;
@@ -181,131 +138,114 @@ static int is_frida_thread_name(const char *name)
     static const char *keywords[] = {
         "gmain", "gdbus", "gum-js-loop", "pool-frida",
         "linjector", "frida", "agent-main", "v8:",
-        "gum-js", "pool-spawner",
     };
     
     int num = sizeof(keywords) / sizeof(keywords[0]);
     for (int i = 0; i < num; i++) {
-        if (my_strcasestr(name, keywords[i])) return 1;
+        if (my_strstr(name, keywords[i])) return 1;
     }
     return 0;
 }
 
-// 检查是否是 frida 相关的映射内容
-static int is_frida_mapping_content(const char *buf, size_t len)
+// 检查是否是 frida 相关的映射
+static int is_frida_mapping(const char *buf, size_t len)
 {
     if (!buf || len == 0) return 0;
     
     static const char *keywords[] = {
-        "frida-agent", "frida-gadget", "re.frida.server",
-        "gum-js-loop", "gum-js", "pool-frida", "linjector",
-        "memfd:frida", "memfd:gum", "frida_agent",
-        "/data/local/tmp/re.frida", "gadget",
+        "frida", "Frida", "FRIDA", "gadget", "Gadget",
+        "gum-js", "frida-agent", "frida_agent", "linjector",
+        "re.frida", "agent-", "/data/local/tmp/",
     };
     
     int num = sizeof(keywords) / sizeof(keywords[0]);
     for (int i = 0; i < num; i++) {
-        // 使用不区分大小写的搜索
-        size_t klen = my_strlen(keywords[i]);
-        for (size_t j = 0; j + klen <= len; j++) {
-            int match = 1;
-            for (size_t k = 0; k < klen; k++) {
-                if (my_tolower(buf[j + k]) != my_tolower(keywords[i][k])) {
-                    match = 0;
-                    break;
-                }
+        if (my_memmem(buf, len, keywords[i], my_strlen(keywords[i]))) {
+            return 1;
+        }
+    }
+    
+    // 检查 memfd: 特殊情况
+    char *pos = (char *)my_memmem(buf, len, "memfd:", 6);
+    if (pos) {
+        size_t remaining = len - (pos - buf);
+        if (remaining > 6) {
+            // memfd:frida 或 memfd:jit-cache 等
+            if (my_memmem(pos + 6, remaining - 6, "frida", 5) ||
+                my_memmem(pos + 6, remaining - 6, "jit", 3) ||
+                my_memmem(pos + 6, remaining - 6, "agent", 5)) {
+                return 1;
             }
-            if (match) return 1;
         }
     }
     return 0;
 }
 
-// 检查并修复 RWX 权限行
-// maps 格式: 7c00000000-7c00001000 rwxp 00000000 fe:00 12345  /path/to/lib.so
-static int fix_rwx_in_line(char *line, size_t len)
+// 检查并修复 RWX 权限 - 将 rwxp 改为 r-xp
+static void fix_rwx_permission(char *line, size_t len)
 {
-    if (!line || len < 25) return 0;
+    if (!line || len < 20) return;
     
-    // 找到权限字段位置 (在第一个空格之后)
-    char *space = 0;
-    for (size_t i = 0; i < len; i++) {
+    // maps 格式: addr-addr rwxp offset ...
+    // 权限字段通常在第一个空格后
+    char *perm = 0;
+    for (size_t i = 0; i < len - 4; i++) {
         if (line[i] == ' ') {
-            space = &line[i];
+            perm = &line[i + 1];
             break;
         }
     }
     
-    if (!space || (size_t)(space - line + 5) > len) return 0;
-    
-    char *perms = space + 1;
+    if (!perm) return;
     
     // 检查是否是 rwxp 或 rwxs
-    if (perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
-        // 检查是否是 libc.so 相关
-        if (my_strcasestr(line, "libc.so")) {
-            // 将 rwx 改为 r-x
-            perms[1] = '-';
-            LOGV("fixed libc rwx -> r-x\n");
-            return 1;
+    if (perm[0] == 'r' && perm[1] == 'w' && perm[2] == 'x') {
+        // 检查是否是 libc.so 或 libdl.so 相关
+        if (my_memmem(line, len, "libc.so", 7) ||
+            my_memmem(line, len, "libdl.so", 8) ||
+            my_memmem(line, len, "linker", 6)) {
+            // 将 rwx 改为 r-x (代码段) 或 rw- (数据段)
+            // 根据地址范围判断，这里简单处理为 r-x
+            perm[1] = '-';  // rwx -> r-x
+            LOGV("fixed rwx permission in maps\n");
         }
     }
-    return 0;
 }
 
-// 检查是否应该隐藏整行
-static int should_hide_map_line(const char *line, size_t len)
+// 检查是否是可疑的匿名映射（可能是 Frida 注入的代码）
+static int is_suspicious_anon_mapping(const char *line, size_t len)
 {
-    if (!line || len == 0) return 0;
+    if (!line || len < 10) return 0;
     
-    // 1. 检查 frida 特征关键字
-    if (is_frida_mapping_content(line, len)) {
-        return 1;
-    }
-    
-    // 2. 检查 memfd 匿名映射
-    if (my_memmem(line, len, "memfd:", 6)) {
-        // memfd:frida, memfd:gum 等
-        if (my_strcasestr(line, "frida") || 
-            my_strcasestr(line, "gum") ||
-            my_strcasestr(line, "jit-cache")) {
-            return 1;
+    // 检查是否有 rwx 权限
+    char *perm = 0;
+    for (size_t i = 0; i < len - 4; i++) {
+        if (line[i] == ' ') {
+            perm = &line[i + 1];
+            break;
         }
     }
     
-    // 3. 检查 /data/local/tmp 下的可疑文件
-    if (my_memmem(line, len, "/data/local/tmp/", 16)) {
-        if (my_strcasestr(line, "frida") ||
-            my_strcasestr(line, "gadget") ||
-            my_strcasestr(line, "agent")) {
-            return 1;
+    if (!perm) return 0;
+    
+    // rwxp 匿名映射可能是 Frida JIT 代码
+    if (perm[0] == 'r' && perm[1] == 'w' && perm[2] == 'x' && perm[3] == 'p') {
+        // 检查是否是匿名映射（行尾没有文件路径或只有 [anon:...]）
+        if (my_memmem(line, len, "[anon:", 6)) {
+            // 检查是否是可疑的匿名映射名称
+            if (my_memmem(line, len, "jit", 3) ||
+                my_memmem(line, len, "frida", 5) ||
+                my_memmem(line, len, "gum", 3)) {
+                return 1;
+            }
         }
     }
-    
     return 0;
 }
 
 static int is_frida_port(uint16_t port)
 {
     return (port >= FRIDA_PORT_START && port <= FRIDA_PORT_END);
-}
-
-// 检查 fd 链接目标是否是 frida 相关
-static int is_frida_fd_target(const char *target, size_t len)
-{
-    if (!target || len == 0) return 0;
-    
-    static const char *keywords[] = {
-        "frida-agent", "frida-gadget", "re.frida.server",
-        "gum-js-loop", "gum-js", "pool-frida", "linjector",
-        "memfd:frida", "memfd:gum",
-    };
-    
-    int num = sizeof(keywords) / sizeof(keywords[0]);
-    for (int i = 0; i < num; i++) {
-        if (my_strcasestr(target, keywords[i])) return 1;
-    }
-    return 0;
 }
 
 // ==================== Hook 函数 ====================
@@ -334,15 +274,22 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
     char *new_data = m->buf + old_count;
     size_t new_len = m->count - old_count;
     
-    // 1. 检查是否应该隐藏整行
-    if (should_hide_map_line(new_data, new_len)) {
+    // 1. 检查是否包含 frida 特征，如果是则隐藏整行
+    if (is_frida_mapping(new_data, new_len)) {
         m->count = old_count;
-        LOGV("hidden frida mapping line\n");
+        LOGV("hidden frida mapping\n");
         return;
     }
     
-    // 2. 修复 RWX 权限
-    fix_rwx_in_line(new_data, new_len);
+    // 2. 检查是否是可疑的匿名映射
+    if (is_suspicious_anon_mapping(new_data, new_len)) {
+        m->count = old_count;
+        LOGV("hidden suspicious anon mapping\n");
+        return;
+    }
+    
+    // 3. 修复 RWX 权限（针对 libc 等系统库）
+    fix_rwx_permission(new_data, new_len);
 }
 
 // tcp_v4_connect hook - 阻断 Frida 端口连接
@@ -386,27 +333,23 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
     char *new_data = m->buf + old_count;
     size_t new_len = m->count - old_count;
     
-    // 检查线程名
-    char temp[64];
-    size_t copy_len = new_len < 63 ? new_len : 63;
-    my_memcpy(temp, new_data, copy_len);
-    temp[copy_len] = '\0';
-    
-    // 去掉换行符
-    for (int i = 0; i < (int)copy_len; i++) {
-        if (temp[i] == '\n' || temp[i] == '\r') {
-            temp[i] = '\0';
-            break;
-        }
+    // 临时添加 null 终止符以便字符串操作
+    char saved = 0;
+    if (new_len > 0 && new_len < 256) {
+        saved = new_data[new_len];
+        new_data[new_len] = '\0';
     }
     
-    if (is_frida_thread_name(temp)) {
-        // 替换为普通线程名
-        const char *fake = "binder:0\n";
-        size_t fake_len = 9;
-        my_memcpy(new_data, fake, fake_len);
+    if (is_frida_thread_name(new_data)) {
+        const char *fake = "kworker\n";
+        size_t fake_len = 8;
+        for (int j = 0; j < (int)fake_len; j++) {
+            new_data[j] = fake[j];
+        }
         m->count = old_count + fake_len;
-        LOGV("hidden frida thread: %s\n", temp);
+        LOGV("hidden frida thread name\n");
+    } else if (saved) {
+        new_data[new_len] = saved;
     }
 }
 
@@ -418,33 +361,31 @@ static void after_get_task_comm(hook_fargs3_t *args, void *udata)
     if (!buf) return;
     
     if (is_frida_thread_name(buf)) {
-        const char *fake = "binder:0";
-        my_memcpy(buf, fake, 9);
+        buf[0] = 'k'; buf[1] = 'w'; buf[2] = 'o'; buf[3] = 'r';
+        buf[4] = 'k'; buf[5] = 'e'; buf[6] = 'r'; buf[7] = '\0';
         LOGV("hidden frida thread comm\n");
     }
 }
 
-// do_readlinkat hook - 隐藏 /proc/pid/fd 中的 frida 链接
-static void before_do_readlinkat(hook_fargs4_t *args, void *udata)
+// proc_pid_readlink hook - 隐藏 /proc/pid/fd 中的 frida 相关链接
+static void after_proc_pid_readlink(hook_fargs4_t *args, void *udata)
 {
-    args->local.data0 = 0;
-}
-
-static void after_do_readlinkat(hook_fargs4_t *args, void *udata)
-{
+    // 如果返回值 > 0，表示成功读取了链接
     long ret = (long)args->ret;
     if (ret <= 0) return;
     
-    // 这里需要检查返回的路径内容
-    // 由于是用户空间缓冲区，处理较复杂
-    // 暂时跳过详细实现
+    char __user *buffer = (char __user *)args->arg1;
+    if (!buffer) return;
+    
+    // 这里需要从用户空间读取数据检查
+    // 由于复杂性，暂时跳过详细实现
 }
 
 // ==================== 模块入口 ====================
 
 static long frida_hide_init(const char *args, const char *event, void *__user reserved)
 {
-    LOGV("loading version: %s\n", MYKPM_VERSION);
+    LOGV("loading enhanced version: %s\n", MYKPM_VERSION);
     
     int hooks_installed = 0;
     
@@ -462,8 +403,6 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
             LOGV("hook show_map_vma failed: %d\n", err);
             show_map_vma_addr = 0;
         }
-    } else {
-        LOGV("show_map_vma not found\n");
     }
     
     // 2. Hook show_smap - 同样处理 smaps
@@ -496,7 +435,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
     
-    // 4. Hook comm_show - 隐藏线程名
+    // 4. Hook comm_show 或 __get_task_comm - 隐藏线程名
     uint64_t comm_show_addr = kallsyms_lookup_name("comm_show");
     if (comm_show_addr) {
         hook_err_t err = hook_wrap2((void *)comm_show_addr, 
@@ -509,7 +448,6 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
             hooks_installed++;
         }
     } else {
-        // 尝试 hook __get_task_comm
         uint64_t get_task_comm_addr = kallsyms_lookup_name("__get_task_comm");
         if (!get_task_comm_addr) {
             get_task_comm_addr = kallsyms_lookup_name("get_task_comm");
@@ -527,22 +465,15 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
     
-    // 5. 尝试 hook proc_pid_readlink 处理 fd 链接
-    proc_pid_readlink_addr = kallsyms_lookup_name("proc_pid_readlink");
-    if (proc_pid_readlink_addr) {
-        // 这个 hook 比较复杂，暂时跳过
-        LOGV("proc_pid_readlink found at 0x%llx (not hooked)\n", proc_pid_readlink_addr);
-    }
-    
     LOGV("loaded successfully, %d hooks installed\n", hooks_installed);
     return 0;
 }
 
 static long frida_hide_control0(const char *args, char *__user out_msg, int outlen)
 {
-    char msg[64] = "frida_hide: OK, hooks active";
+    char msg[] = "frida_hide: enhanced version OK";
     if (out_msg && outlen > 0) {
-        int len = my_strlen(msg) + 1;
+        int len = sizeof(msg);
         if (len > outlen) len = outlen;
         compat_copy_to_user(out_msg, msg, len);
     }
