@@ -21,8 +21,6 @@ KPM_DESCRIPTION("Hide Frida injection from detection");
 
 #define AF_INET 2
 #define ECONNREFUSED 111
-
-// UID 常量
 #define UID_APP_START 10000
 
 // ==================== 结构体定义 ====================
@@ -32,6 +30,9 @@ struct seq_file {
     size_t size;
     size_t from;
     size_t count;
+    size_t pad_until;
+    loff_t index;
+    loff_t read_pos;
 };
 
 struct sockaddr_in {
@@ -44,6 +45,7 @@ struct sockaddr_in {
 // ==================== 全局变量 ====================
 
 static uint64_t show_map_vma_addr = 0;
+static uint64_t show_smap_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
 static uint64_t comm_write_addr = 0;
 
@@ -103,15 +105,12 @@ static inline uint16_t bswap16(uint16_t val)
     return (val >> 8) | (val << 8);
 }
 
-// 检查是否是普通应用（UID >= 10000）
 static int is_app_process(void)
 {
-    // 使用 KernelPatch 提供的 current_uid() 函数
     uid_t uid = current_uid();
     return (uid >= UID_APP_START);
 }
 
-// 检查是否是 frida 相关线程名
 static int is_frida_thread_name(const char *name)
 {
     if (!name || !*name) return 0;
@@ -122,6 +121,7 @@ static int is_frida_thread_name(const char *name)
         "gum-js-loop",
         "pool-frida",
         "linjector",
+        "frida",
     };
     
     int num = sizeof(keywords) / sizeof(keywords[0]);
@@ -138,21 +138,43 @@ static int contains_frida_string(const char *buf, size_t len)
 {
     if (!buf || len == 0) return 0;
     
+    // 关键词列表
     static const char *keywords[] = {
         "frida",
+        "Frida", 
+        "FRIDA",
         "gadget",
+        "Gadget",
         "gum-js",
+        "frida-agent",
+        "frida_agent",
+        "linjector",
+        "memfd:",
     };
     
     int num = sizeof(keywords) / sizeof(keywords[0]);
     for (int i = 0; i < num; i++) {
-        if (my_memmem(buf, len, keywords[i], my_strlen(keywords[i])))
+        if (my_memmem(buf, len, keywords[i], my_strlen(keywords[i]))) {
+            // 对于 memfd: 需要进一步检查
+            if (i == 9) { // memfd:
+                // 检查 memfd 后面是否有 frida/agent 相关
+                char *pos = (char *)my_memmem(buf, len, "memfd:", 6);
+                if (pos) {
+                    size_t remaining = len - (pos - buf);
+                    if (my_memmem(pos, remaining, "frida", 5) ||
+                        my_memmem(pos, remaining, "agent", 5) ||
+                        my_memmem(pos, remaining, "gum", 3)) {
+                        return 1;
+                    }
+                }
+                continue;
+            }
             return 1;
+        }
     }
     return 0;
 }
 
-// 检查端口是否是 frida 端口
 static int is_frida_port(uint16_t port)
 {
     return (port >= FRIDA_PORT_START && port <= FRIDA_PORT_END);
@@ -160,7 +182,7 @@ static int is_frida_port(uint16_t port)
 
 // ==================== Hook 函数 ====================
 
-// 1. show_map_vma hook - 隐藏 /proc/pid/maps 中的 frida 映射
+// show_map_vma hook - 隐藏 /proc/pid/maps 中的 frida 映射
 static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 {
     struct seq_file *m = (struct seq_file *)args->arg0;
@@ -179,22 +201,19 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
         return;
     
     size_t old_count = (size_t)args->local.data0;
-    if (old_count == 0)
-        return;
     
-    // 检查新增的内容是否包含 frida 相关字符串
     if (m->count > old_count) {
         const char *new_data = m->buf + old_count;
         size_t new_len = m->count - old_count;
         
         if (contains_frida_string(new_data, new_len)) {
-            // 回滚，隐藏这一行
             m->count = old_count;
+            LOGV("hidden frida mapping\n");
         }
     }
 }
 
-// 2. tcp_v4_connect hook - 只阻止普通应用连接 frida 端口
+// tcp_v4_connect hook
 static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
 {
     struct sockaddr_in *addr = (struct sockaddr_in *)args->arg1;
@@ -202,29 +221,23 @@ static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
     if (!addr)
         return;
     
-    // 检查是否是 AF_INET
     if (addr->sin_family != AF_INET)
         return;
     
     uint16_t port = bswap16(addr->sin_port);
     
-    // 检查是否是 frida 端口
     if (!is_frida_port(port))
         return;
     
-    // 关键：只阻止普通应用（UID >= 10000）
-    // 允许 root (0) 和 shell (2000) 进程正常连接
-    if (!is_app_process()) {
+    if (!is_app_process())
         return;
-    }
     
-    // 普通应用尝试连接 frida 端口，阻止
-    LOGV("blocked app (uid=%d) connect to port %d\n", current_uid(), port);
+    LOGV("blocked connect to port %d\n", port);
     args->ret = (uint64_t)(-(long)ECONNREFUSED);
     args->skip_origin = 1;
 }
 
-// 3. comm_show hook - 隐藏 /proc/pid/task/tid/comm 中的 frida 线程名
+// comm_show hook
 static void before_comm_show(hook_fargs2_t *args, void *udata)
 {
     args->local.data0 = 0;
@@ -247,23 +260,19 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
         char *new_data = m->buf + old_count;
         size_t new_len = m->count - old_count;
         
-        // 临时添加 null 终止符来检查字符串
         char saved = 0;
         if (new_len > 0 && new_len < 256) {
             saved = new_data[new_len];
             new_data[new_len] = '\0';
         }
         
-        // 检查是否包含 frida 线程名
         if (is_frida_thread_name(new_data)) {
-            // 替换为假名
             const char *fake = "kworker\n";
-            size_t fake_len = my_strlen(fake);
-            
-            char *p = new_data;
-            const char *f = fake;
-            while (*f) {
-                *p++ = *f++;
+            size_t fake_len = 8;
+            int j = 0;
+            while (j < (int)fake_len) {
+                new_data[j] = fake[j];
+                j++;
             }
             m->count = old_count + fake_len;
         } else if (saved) {
@@ -272,7 +281,7 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
     }
 }
 
-// 4. __get_task_comm hook - 备选方案
+// __get_task_comm hook
 static void after_get_task_comm(hook_fargs3_t *args, void *udata)
 {
     char *buf = (char *)args->arg0;
@@ -300,7 +309,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     
     int hooks_installed = 0;
     
-    // 1. Hook show_map_vma - 隐藏 maps
+    // 1. Hook show_map_vma
     show_map_vma_addr = kallsyms_lookup_name("show_map_vma");
     if (show_map_vma_addr) {
         hook_err_t err = hook_wrap2((void *)show_map_vma_addr, 
@@ -318,7 +327,25 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         LOGV("show_map_vma not found\n");
     }
     
-    // 2. Hook tcp_v4_connect - 阻止普通应用连接 frida 端口
+    // 2. Hook show_smap
+    show_smap_addr = kallsyms_lookup_name("show_smap");
+    if (show_smap_addr) {
+        hook_err_t err = hook_wrap2((void *)show_smap_addr, 
+                                    before_show_map_vma, 
+                                    after_show_map_vma, 
+                                    (void *)0);
+        if (err == HOOK_NO_ERR) {
+            LOGV("show_smap hooked at 0x%llx\n", show_smap_addr);
+            hooks_installed++;
+        } else {
+            LOGV("hook show_smap failed: %d\n", err);
+            show_smap_addr = 0;
+        }
+    } else {
+        LOGV("show_smap not found\n");
+    }
+    
+    // 3. Hook tcp_v4_connect
     tcp_v4_connect_addr = kallsyms_lookup_name("tcp_v4_connect");
     if (tcp_v4_connect_addr) {
         hook_err_t err = hook_wrap3((void *)tcp_v4_connect_addr, 
@@ -336,7 +363,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         LOGV("tcp_v4_connect not found\n");
     }
     
-    // 3. Hook comm_show - 隐藏线程名
+    // 4. Hook comm_show
     uint64_t comm_show_addr = kallsyms_lookup_name("comm_show");
     if (comm_show_addr) {
         hook_err_t err = hook_wrap2((void *)comm_show_addr, 
@@ -370,8 +397,6 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
             } else {
                 LOGV("hook get_task_comm failed: %d\n", err);
             }
-        } else {
-            LOGV("get_task_comm not found\n");
         }
     }
     
@@ -381,15 +406,12 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
 
 static long frida_hide_control0(const char *args, char *__user out_msg, int outlen)
 {
-    LOGV("control0 called\n");
-    
     char msg[] = "frida_hide: OK";
     if (out_msg && outlen > 0) {
         int len = sizeof(msg);
         if (len > outlen) len = outlen;
         compat_copy_to_user(out_msg, msg, len);
     }
-    
     return 0;
 }
 
@@ -400,6 +422,11 @@ static long frida_hide_exit(void *__user reserved)
     if (show_map_vma_addr) {
         unhook((void *)show_map_vma_addr);
         show_map_vma_addr = 0;
+    }
+    
+    if (show_smap_addr) {
+        unhook((void *)show_smap_addr);
+        show_smap_addr = 0;
     }
     
     if (tcp_v4_connect_addr) {
