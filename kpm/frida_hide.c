@@ -5,30 +5,49 @@
 #include <kputils.h>
 #include <linux/printk.h>
 #include <linux/errno.h>
-#include <linux/uaccess.h>
 #include <syscall.h>
 #include <asm/current.h>
-#include <linux/types.h>
-#include "linux/include/linux/string.h"
-#include <linux/err.h>
-#include <linux/kernel.h>
-#include <linux/list.h>
-
-// --- 移除导致报错的头文件，改为下方手动定义 ---
-// #include <linux/dirent.h> 
-// #include <linux/socket.h>
-// #include <linux/in.h>
-// #include <linux/net.h>
+// 移除冲突的 linux/types.h，使用 KPM 提供的基础类型或手动定义
+// 移除其他可能导致冲突的 include
 
 KPM_NAME("kpm-frida-hide");
-KPM_VERSION("r22");
+KPM_VERSION("r23");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("popy");
 KPM_DESCRIPTION("Hide Frida artifacts from detection");
 
-// --- 手动定义缺失的结构体和宏 (Self-contained) ---
+// --- 基础类型定义 (如果环境缺失) ---
+// 大部分 KPM 环境的 ktypes.h 会定义这些，如果编译还报 unknown type，可以取消注释
+// typedef unsigned long size_t;
+// typedef long long int64_t;
+// typedef unsigned long long uint64_t;
 
-// 1. dirent64 结构体 (用于 sys_getdents64)
+// --- 内存管理定义 ---
+#define GFP_KERNEL 0x400  // __GFP_RECLAIM / ___GFP_WAIT (常用值)
+#define GFP_ATOMIC 0x20
+
+typedef void *(*t_kmalloc)(size_t size, unsigned int flags);
+typedef void (*t_kfree)(const void *objp);
+typedef void *(*t_memset)(void *s, int c, size_t n);
+typedef void *(*t_memmove)(void *dest, const void *src, size_t n);
+
+static t_kmalloc got_kmalloc = NULL;
+static t_kfree got_kfree = NULL;
+static t_memset got_memset = NULL;
+static t_memmove got_memmove = NULL;
+
+// 自实现 kzalloc (kmalloc + memset)
+static inline void *my_kzalloc(size_t size, unsigned int flags) {
+    if (!got_kmalloc || !got_memset) return NULL;
+    void *ptr = got_kmalloc(size, flags);
+    if (ptr) {
+        got_memset(ptr, 0, size);
+    }
+    return ptr;
+}
+
+// --- 结构体手动定义 ---
+
 struct linux_dirent64 {
     u64            d_ino;
     s64            d_off;
@@ -37,46 +56,34 @@ struct linux_dirent64 {
     char           d_name[];
 };
 
-// 2. 网络相关定义 (用于 sys_connect)
-#define AF_INET     2
+#define AF_INET 2
 
-// 从内核源码中提取的 sockaddr 定义
-struct sockaddr {
-    unsigned short sa_family;   /* address family, AF_xxx   */
-    char           sa_data[14]; /* 14 bytes of protocol address */
-};
-
-// 从内核源码中提取的 sockaddr_in 定义
 struct in_addr {
     unsigned int s_addr;
 };
 
 struct sockaddr_in {
-    unsigned short sin_family;  /* Address family       */
-    unsigned short sin_port;    /* Port number          */
-    struct in_addr sin_addr;    /* Internet address     */
-    unsigned char  __pad[8];    /* Pad to size of `struct sockaddr' */
+    unsigned short sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    unsigned char  __pad[8];
 };
 
-// 简单的字节序转换 (ARM64通常是小端，网络是大端)
 static inline unsigned short my_ntohs(unsigned short netshort) {
     return (netshort >> 8) | (netshort << 8);
 }
 
-// --- 类型定义 ---
+// --- 系统调用与辅助函数 ---
 
 typedef unsigned long (*find_copy_from_user)(void *to, const void *from, unsigned long n);
 typedef unsigned long (*find_copy_to_user)(void *to, const void *from, unsigned long n);
 
-// 原始系统调用函数指针类型
 typedef long (*t_syscall_getdents64)(unsigned int fd, struct linux_dirent64 __user *dirent, unsigned int count);
 typedef long (*t_syscall_readlinkat)(int dfd, const char __user *path, char __user *buf, int bufsiz);
 typedef long (*t_syscall_connect)(int fd, struct sockaddr __user *uservaddr, int addrlen);
 
 static find_copy_from_user got_copy_from_user = NULL;
 static find_copy_to_user got_copy_to_user = NULL;
-
-// --- 隐藏配置 ---
 
 static const char* HIDE_KEYWORDS[] = {
     "frida",
@@ -87,17 +94,14 @@ static const char* HIDE_KEYWORDS[] = {
     "re.frida.server",
     "gadget"
 };
-
 #define HIDE_KEYWORDS_COUNT (sizeof(HIDE_KEYWORDS) / sizeof(HIDE_KEYWORDS[0]))
 
-// Frida 默认端口范围
+// Frida Default Ports
 #define FRIDA_PORT_START 27042
 #define FRIDA_PORT_END   27049
 
 static bool install_successful = false;
 static char* control_status = "start";
-
-// --- 辅助函数 ---
 
 static bool should_hide(const char* name) {
     if (!name) return false;
@@ -109,7 +113,7 @@ static bool should_hide(const char* name) {
     return false;
 }
 
-// --- Hook 实现 ---
+// --- Hooks ---
 
 static t_syscall_getdents64 orig_getdents64 = NULL;
 static t_syscall_readlinkat orig_readlinkat = NULL;
@@ -120,12 +124,14 @@ static asmlinkage long hook_sys_getdents64(unsigned int fd, struct linux_dirent6
     long ret = orig_getdents64(fd, dirent, count);
 
     if (ret <= 0 || strcmp(control_status, "start") != 0) return ret;
+    if (!got_kmalloc || !got_kfree) return ret; // Safety check
 
-    struct linux_dirent64 *kdirent = (struct linux_dirent64 *)kzalloc(ret, GFP_KERNEL);
+    // 使用自定义 kzalloc
+    struct linux_dirent64 *kdirent = (struct linux_dirent64 *)my_kzalloc(ret, GFP_KERNEL);
     if (!kdirent) return ret;
 
     if (got_copy_from_user(kdirent, dirent, ret)) {
-        kfree(kdirent);
+        got_kfree(kdirent);
         return ret;
     }
 
@@ -139,8 +145,8 @@ static asmlinkage long hook_sys_getdents64(unsigned int fd, struct linux_dirent6
             long next_offset = pos + reclen;
             long bytes_to_move = ret - next_offset;
             
-            if (bytes_to_move > 0) {
-                memmove(cur, (char *)cur + reclen, bytes_to_move);
+            if (bytes_to_move > 0 && got_memmove) {
+                got_memmove(cur, (char *)cur + reclen, bytes_to_move);
             }
             
             new_ret -= reclen;
@@ -155,7 +161,7 @@ static asmlinkage long hook_sys_getdents64(unsigned int fd, struct linux_dirent6
         got_copy_to_user(dirent, kdirent, new_ret);
     }
     
-    kfree(kdirent);
+    got_kfree(kdirent);
     return new_ret;
 }
 
@@ -164,12 +170,13 @@ static asmlinkage long hook_sys_readlinkat(int dfd, const char __user *path, cha
     long ret = orig_readlinkat(dfd, path, buf, bufsiz);
     
     if (ret <= 0 || strcmp(control_status, "start") != 0) return ret;
+    if (!got_kmalloc || !got_kfree) return ret;
 
-    char *kbuf = kzalloc(ret + 1, GFP_KERNEL);
+    char *kbuf = (char *)my_kzalloc(ret + 1, GFP_KERNEL);
     if (!kbuf) return ret;
 
     if (got_copy_from_user(kbuf, buf, ret)) {
-        kfree(kbuf);
+        got_kfree(kbuf);
         return ret;
     }
     kbuf[ret] = '\0';
@@ -178,14 +185,14 @@ static asmlinkage long hook_sys_readlinkat(int dfd, const char __user *path, cha
         char *fake = "/dev/null";
         int fake_len = strlen(fake);
         if (bufsiz >= fake_len) {
-            memset(kbuf, 0, ret);
+            got_memset(kbuf, 0, ret);
             got_copy_to_user(buf, fake, fake_len);
-            kfree(kbuf);
+            got_kfree(kbuf);
             return fake_len;
         }
     }
 
-    kfree(kbuf);
+    got_kfree(kbuf);
     return ret;
 }
 
@@ -195,37 +202,44 @@ static asmlinkage long hook_sys_connect(int fd, struct sockaddr __user *uservadd
         return orig_connect(fd, uservaddr, addrlen);
     }
 
-    // 手动分配栈空间读取 sockaddr_in
     struct sockaddr_in kaddr;
     if (addrlen >= sizeof(struct sockaddr_in)) {
         if (got_copy_from_user(&kaddr, uservaddr, sizeof(struct sockaddr_in)) == 0) {
             if (kaddr.sin_family == AF_INET) {
-                // 使用我们手写的 my_ntohs 避免依赖网络头文件
                 unsigned int port = my_ntohs(kaddr.sin_port);
-                
                 if (port >= FRIDA_PORT_START && port <= FRIDA_PORT_END) {
-                    // logke("Blocking connection to Frida port: %d", port);
                     return -ECONNREFUSED;
                 }
             }
         }
     }
-
     return orig_connect(fd, uservaddr, addrlen);
 }
 
 
-// --- 模块初始化 ---
+// --- Init & Resolve Symbols ---
 
 bool init_funcs() {
+    // 基础功能函数
     got_copy_from_user = (find_copy_from_user)kallsyms_lookup_name("copy_from_user");
     got_copy_to_user = (find_copy_to_user)kallsyms_lookup_name("copy_to_user");
     
-    if (!got_copy_from_user || !got_copy_to_user) {
-        logke("Failed to find copy_from/to_user");
+    // 内存管理函数 (关键修复)
+    // 尝试查找 __kmalloc，它是很多内核的底层分配符号
+    got_kmalloc = (t_kmalloc)kallsyms_lookup_name("__kmalloc"); 
+    if (!got_kmalloc) got_kmalloc = (t_kmalloc)kallsyms_lookup_name("kmalloc"); // Fallback
+    
+    got_kfree = (t_kfree)kallsyms_lookup_name("kfree");
+    got_memset = (t_memset)kallsyms_lookup_name("memset");
+    got_memmove = (t_memmove)kallsyms_lookup_name("memmove");
+
+    if (!got_copy_from_user || !got_copy_to_user || !got_kmalloc || !got_kfree || !got_memset) {
+        logke("Failed to resolve essential kernel symbols");
+        // 如果找不到，为了防止 Crash，这里返回 false
         return false;
     }
     
+    // 系统调用
     void *sym_getdents64 = (void *)kallsyms_lookup_name("__arm64_sys_getdents64");
     if (!sym_getdents64) sym_getdents64 = (void *)kallsyms_lookup_name("sys_getdents64");
     
@@ -273,10 +287,8 @@ static long uninstall(void *__user reserved)
     if (install_successful) {
         void *sym_getdents64 = (void *)kallsyms_lookup_name("__arm64_sys_getdents64");
         if (!sym_getdents64) sym_getdents64 = (void *)kallsyms_lookup_name("sys_getdents64");
-        
         void *sym_readlinkat = (void *)kallsyms_lookup_name("__arm64_sys_readlinkat");
         if (!sym_readlinkat) sym_readlinkat = (void *)kallsyms_lookup_name("sys_readlinkat");
-        
         void *sym_connect = (void *)kallsyms_lookup_name("__arm64_sys_connect");
         if (!sym_connect) sym_connect = (void *)kallsyms_lookup_name("sys_connect");
 
