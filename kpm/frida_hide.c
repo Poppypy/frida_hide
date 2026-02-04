@@ -4,6 +4,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/cred.h>
 #include <uapi/asm-generic/errno.h>
 #include <hook.h>
 #include <ksyms.h>
@@ -22,6 +23,11 @@ KPM_DESCRIPTION("Hide Frida injection from detection");
 #define AF_INET 2
 #define ECONNREFUSED 111
 
+// UID 常量
+#define UID_ROOT 0
+#define UID_SHELL 2000
+#define UID_APP_START 10000
+
 // ==================== 结构体定义 ====================
 
 struct seq_file {
@@ -38,22 +44,14 @@ struct sockaddr_in {
     char sin_zero[8];
 };
 
-// socket 结构简化
-struct socket {
-    void *state;
-    void *flags;
-    void *file;
-    void *sk;
-    void *ops;
-    // ...
-};
-
 // ==================== 全局变量 ====================
 
 static uint64_t show_map_vma_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
-static uint64_t proc_pid_comm_read_addr = 0;
 static uint64_t comm_write_addr = 0;
+
+// 内核函数指针
+static typeof(current_cred) *current_cred_func = 0;
 
 // ==================== 辅助函数 ====================
 
@@ -109,6 +107,32 @@ static void *my_memmem(const void *haystack, size_t haystacklen,
 static inline uint16_t bswap16(uint16_t val) 
 {
     return (val >> 8) | (val << 8);
+}
+
+// 获取当前进程的 UID
+static int get_current_uid(void)
+{
+    if (!current_cred_func) {
+        return -1;
+    }
+    
+    const struct cred *cred = current_cred_func();
+    if (!cred) {
+        return -1;
+    }
+    
+    // cred->uid 是 kuid_t 结构，取其 val 字段
+    // 不同内核版本可能不同，这里直接读取第一个 int
+    return *(int *)(&cred->uid);
+}
+
+// 检查是否是需要隐藏的普通应用（UID >= 10000）
+static int is_app_process(void)
+{
+    int uid = get_current_uid();
+    // UID >= 10000 是普通应用
+    // UID 0 是 root，UID 2000 是 shell
+    return (uid >= UID_APP_START);
 }
 
 // 检查是否是 frida 相关线程名
@@ -194,7 +218,7 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
     }
 }
 
-// 2. tcp_v4_connect hook - 阻止连接 frida 端口
+// 2. tcp_v4_connect hook - 只阻止普通应用连接 frida 端口
 // int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
 {
@@ -210,48 +234,23 @@ static void before_tcp_v4_connect(hook_fargs3_t *args, void *udata)
     uint16_t port = bswap16(addr->sin_port);
     
     // 检查是否是 frida 端口
-    if (is_frida_port(port)) {
-        LOGV("blocked connect to frida port %d\n", port);
-        // 返回连接被拒绝
-        args->ret = (uint64_t)(-(long)ECONNREFUSED);
-        args->skip_origin = 1;
-    }
-}
-
-// 3. comm_read hook - 隐藏 /proc/pid/task/tid/comm 中的 frida 线程名
-// ssize_t comm_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
-// 或者 hook seq_show for comm
-
-// 方案A: hook proc_pid_comm_read (如果存在)
-static void after_comm_read(hook_fargs4_t *args, void *udata)
-{
-    // 这个比较复杂，因为数据已经复制到用户空间
-    // 需要用 copy_to_user 覆盖
-}
-
-// 方案B: hook __get_task_comm 或 get_task_comm
-// char *__get_task_comm(char *buf, size_t buf_size, struct task_struct *tsk)
-static void after_get_task_comm(hook_fargs3_t *args, void *udata)
-{
-    char *buf = (char *)args->arg0;
-    
-    if (!buf)
+    if (!is_frida_port(port))
         return;
     
-    if (is_frida_thread_name(buf)) {
-        // 替换为普通线程名
-        const char *fake = "kworker";
-        char *p = buf;
-        const char *f = fake;
-        while (*f) {
-            *p++ = *f++;
-        }
-        *p = '\0';
+    // 关键：只阻止普通应用（UID >= 10000）
+    // 允许 root (0) 和 shell (2000) 进程正常连接
+    if (!is_app_process()) {
+        // root/shell 进程，允许连接
+        return;
     }
+    
+    // 普通应用尝试连接 frida 端口，阻止
+    LOGV("blocked app (uid=%d) connect to frida port %d\n", get_current_uid(), port);
+    args->ret = (uint64_t)(-(long)ECONNREFUSED);
+    args->skip_origin = 1;
 }
 
-// 方案C: hook comm_show (seq_file 方式读取 comm)
-// int comm_show(struct seq_file *m, void *v)
+// 3. comm_show hook - 隐藏 /proc/pid/task/tid/comm 中的 frida 线程名
 static void before_comm_show(hook_fargs2_t *args, void *udata)
 {
     args->local.data0 = 0;
@@ -274,6 +273,13 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
         char *new_data = m->buf + old_count;
         size_t new_len = m->count - old_count;
         
+        // 临时添加 null 终止符来检查字符串
+        char saved = 0;
+        if (new_len > 0 && new_len < 256) {
+            saved = new_data[new_len];
+            new_data[new_len] = '\0';
+        }
+        
         // 检查是否包含 frida 线程名
         if (is_frida_thread_name(new_data)) {
             // 替换为假名
@@ -283,11 +289,35 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
             // 覆盖内容
             char *p = new_data;
             const char *f = fake;
-            while (*f && (size_t)(p - new_data) < new_len) {
+            while (*f) {
                 *p++ = *f++;
             }
             m->count = old_count + fake_len;
+        } else if (saved) {
+            // 恢复
+            new_data[new_len] = saved;
         }
+    }
+}
+
+// 4. __get_task_comm hook - 备选方案
+static void after_get_task_comm(hook_fargs3_t *args, void *udata)
+{
+    char *buf = (char *)args->arg0;
+    
+    if (!buf)
+        return;
+    
+    if (is_frida_thread_name(buf)) {
+        // 替换为普通线程名
+        buf[0] = 'k';
+        buf[1] = 'w';
+        buf[2] = 'o';
+        buf[3] = 'r';
+        buf[4] = 'k';
+        buf[5] = 'e';
+        buf[6] = 'r';
+        buf[7] = '\0';
     }
 }
 
@@ -298,6 +328,14 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     LOGV("loading, version: %s\n", MYKPM_VERSION);
     
     int hooks_installed = 0;
+    
+    // 获取 current_cred 函数指针
+    current_cred_func = (typeof(current_cred) *)kallsyms_lookup_name("current_cred");
+    if (!current_cred_func) {
+        LOGV("current_cred not found, will block all connections to frida ports\n");
+    } else {
+        LOGV("current_cred found at 0x%llx\n", (uint64_t)current_cred_func);
+    }
     
     // 1. Hook show_map_vma - 隐藏 maps
     show_map_vma_addr = kallsyms_lookup_name("show_map_vma");
@@ -317,7 +355,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         LOGV("show_map_vma not found\n");
     }
     
-    // 2. Hook tcp_v4_connect - 阻止连接 frida 端口
+    // 2. Hook tcp_v4_connect - 阻止普通应用连接 frida 端口
     tcp_v4_connect_addr = kallsyms_lookup_name("tcp_v4_connect");
     if (tcp_v4_connect_addr) {
         hook_err_t err = hook_wrap3((void *)tcp_v4_connect_addr, 
@@ -335,7 +373,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         LOGV("tcp_v4_connect not found\n");
     }
     
-    // 3. Hook comm_show - 隐藏线程名 (方案C)
+    // 3. Hook comm_show - 隐藏线程名
     uint64_t comm_show_addr = kallsyms_lookup_name("comm_show");
     if (comm_show_addr) {
         hook_err_t err = hook_wrap2((void *)comm_show_addr, 
@@ -344,7 +382,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
                                     (void *)0);
         if (err == HOOK_NO_ERR) {
             LOGV("comm_show hooked at 0x%llx\n", comm_show_addr);
-            comm_write_addr = comm_show_addr;  // 保存用于 unhook
+            comm_write_addr = comm_show_addr;
             hooks_installed++;
         } else {
             LOGV("hook comm_show failed: %d\n", err);
@@ -375,50 +413,17 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
     
-    // 4. 尝试 hook proc_pid_cmdline_read (可选，用于隐藏 cmdline)
-    uint64_t cmdline_addr = kallsyms_lookup_name("proc_pid_cmdline_read");
-    if (cmdline_addr) {
-        LOGV("proc_pid_cmdline_read found at 0x%llx (not hooked yet)\n", cmdline_addr);
-    }
-    
     LOGV("loaded, %d hooks installed\n", hooks_installed);
     return 0;
 }
 
 static long frida_hide_control0(const char *args, char *__user out_msg, int outlen)
 {
-    LOGV("control0 called, args=%s\n", args ? args : "null");
+    LOGV("control0 called\n");
     
-    char msg[64];
-    int len = 0;
-    
-    // 简单的状态报告
-    msg[len++] = 'O';
-    msg[len++] = 'K';
-    msg[len++] = ':';
-    msg[len++] = ' ';
-    msg[len++] = 'm';
-    msg[len++] = 'a';
-    msg[len++] = 'p';
-    msg[len++] = 's';
-    msg[len++] = '=';
-    msg[len++] = show_map_vma_addr ? '1' : '0';
-    msg[len++] = ',';
-    msg[len++] = 't';
-    msg[len++] = 'c';
-    msg[len++] = 'p';
-    msg[len++] = '=';
-    msg[len++] = tcp_v4_connect_addr ? '1' : '0';
-    msg[len++] = ',';
-    msg[len++] = 'c';
-    msg[len++] = 'o';
-    msg[len++] = 'm';
-    msg[len++] = 'm';
-    msg[len++] = '=';
-    msg[len++] = comm_write_addr ? '1' : '0';
-    msg[len++] = '\0';
-    
+    char msg[] = "frida_hide: OK";
     if (out_msg && outlen > 0) {
+        int len = sizeof(msg);
         if (len > outlen) len = outlen;
         compat_copy_to_user(out_msg, msg, len);
     }
