@@ -1,10 +1,8 @@
 # KPM 版本号
 MYKPM_VERSION ?= v0.0.0
 
-# KernelPatch 内核源码目录
-ifndef KP_DIR
-    KP_DIR = .
-endif
+# KernelPatch 内核源码目录 (相对于当前目录)
+KP_DIR := kernel
 
 # 系统检测
 OS_NAME = $(shell uname | tr A-Z a-z)
@@ -28,16 +26,14 @@ NDK_PATH ?= $(ANDROID_NDK)/$(NDK_BIN_DIR)
 CC := $(NDK_PATH)/aarch64-linux-android31-clang
 LD := $(NDK_PATH)/ld.lld
 
-# 头文件路径 - 关键修复
-INCLUDE_DIRS := \
-    . \
-    include \
-    patch/include \
-    linux/include \
-    linux/arch/arm64/include \
-    linux/tools/arch/arm64/include
-
-INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
+# 头文件路径 - 修正后的路径
+INCLUDE_FLAGS := \
+    -I$(KP_DIR)/kernel/patch/include \
+    -I$(KP_DIR)/kernel/include \
+    -I$(KP_DIR)/kernel/linux/include \
+    -I$(KP_DIR)/kernel/linux/arch/arm64/include \
+    -I$(KP_DIR)/kernel/base/include \
+    -I$(KP_DIR)/user/include
 
 # 编译选项
 CFLAGS = -Wall -O2 \
@@ -59,16 +55,4 @@ objs := $(BUILD_DIR)/frida_hide.o
 all: $(BUILD_DIR)/frida_hide_$(MYKPM_VERSION).kpm
 
 # 链接 KPM 文件
-$(BUILD_DIR)/frida_hide_$(MYKPM_VERSION).kpm: $(objs)
-	@echo "Linking: $@"
-	$(CC) -r -o $@ $^
-	@echo "Done: $@"
-
-# 编译 C 源文件
-$(BUILD_DIR)/%.o: %.c
-	@echo "Compiling: $<"
-	$(CC) $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
-
-.PHONY: clean
-clean:
-	rm -rf $(BUILD_DIR)
+$(BUILD_DIR)/fr
