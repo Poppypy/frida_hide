@@ -11,7 +11,11 @@
 #include "linux/string.h"
 #include <asm/current.h>
 
-
+KPM_NAME("kpm-frida-hide");
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("popy");
+KPM_DESCRIPTION("Hide Frida artifacts from detection");
 struct seq_file{
     char *buf;
 	size_t size;
