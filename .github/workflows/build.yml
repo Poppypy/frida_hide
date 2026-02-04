@@ -15,9 +15,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Checkout KernelPatch
+    - name: Setup KernelPatch source
       run: |
         cd kpm
+        rm -rf kernel
         git clone --depth=1 https://github.com/bmax121/KernelPatch.git kernel
 
     - name: Install Android NDK
