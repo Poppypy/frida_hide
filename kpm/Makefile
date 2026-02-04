@@ -26,8 +26,16 @@ NDK_PATH ?= $(ANDROID_NDK)/$(NDK_BIN_DIR)
 CC := $(NDK_PATH)/aarch64-linux-android31-clang
 LD := $(NDK_PATH)/ld.lld
 
-# 头文件路径
-INCLUDE_FLAGS := -I$(KP_DIR)/kernel/patch/include -I$(KP_DIR)/kernel/include -I$(KP_DIR)/kernel/linux/include -I$(KP_DIR)/kernel/linux/arch/arm64/include -I$(KP_DIR)/kernel/base/include
+# 头文件路径 - 完整路径
+INCLUDE_FLAGS := \
+    -I$(KP_DIR)/kernel/patch/include \
+    -I$(KP_DIR)/kernel/include \
+    -I$(KP_DIR)/kernel/linux/include \
+    -I$(KP_DIR)/kernel/linux/arch/arm64/include \
+    -I$(KP_DIR)/kernel/linux/arch/arm64/include/generated \
+    -I$(KP_DIR)/kernel/linux/arch/arm64/include/uapi \
+    -I$(KP_DIR)/kernel/linux/include/uapi \
+    -I$(KP_DIR)/kernel/base/include
 
 # 编译选项
 CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -DMYKPM_VERSION=\"$(MYKPM_VERSION)\"
@@ -47,7 +55,7 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/frida_hide_$(MYKPM_VERSION).kpm: $(objs)
 	@echo "Linking: $@"
-	$(CC) -r -o $@ $^
+	$(LD) -r -o $@ $^
 	@echo "Done: $@"
 
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
