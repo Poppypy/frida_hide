@@ -65,11 +65,7 @@ static uint64_t do_filp_open_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
 static uint64_t comm_write_addr = 0;
 
-// 用于 getname 的函数指针
-static struct filename *(*kfunc_getname)(const char __user *) = NULL;
-static void (*kfunc_putname)(struct filename *) = NULL;
-
-// filename 结构体（简化版）
+// filename 结构体（简化版，用于 do_filp_open）
 struct filename {
     const char *name;
     // 其他字段省略
