@@ -29,13 +29,7 @@ KPM_DESCRIPTION("Advanced Frida/Root/Xposed Detection Bypass - Fixed Version");
 #define MAX_LINE_LEN 512
 
 // ==================== 类型定义 ====================
-typedef unsigned int uid_t;
-typedef unsigned int gid_t;
-
-// kuid_t 结构体定义
-typedef struct {
-    uid_t val;
-} kuid_t;
+// 注意：uid_t, gid_t, kuid_t 等类型已在 ktypes.h 中定义，无需重复定义
 
 // ==================== 结构体定义 ====================
 // 注意：这里不直接定义 seq_file，而是使用偏移量访问
