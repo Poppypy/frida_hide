@@ -60,6 +60,8 @@ static uint64_t show_smap_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
 static uint64_t tcp_v6_connect_addr = 0;
 static uint64_t do_faccessat_addr = 0;
+static uint64_t do_statx_addr = 0;
+static uint64_t do_sys_openat2_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
 static uint64_t comm_write_addr = 0;
 
@@ -289,11 +291,13 @@ static int is_sensitive_path(const char *path)
         "/system/sbin/su", "/sbin/su",
         "/vendor/bin/su", "/su/bin/su",
         "/data/local/tmp/su", "/data/local/su",
+        "/su", "/bin/su",
 
         // ===== Magisk =====
         "/sbin/.magisk", "/.magisk",
         "/data/adb/magisk", "/system/bin/magisk",
         "/data/data/com.topjohnwu.magisk",
+        "/data/adb",  // 关键：直接匹配 /data/adb
 
         // ===== KernelSU =====
         "/data/adb/ksu", "/data/adb/ksud",
@@ -332,8 +336,28 @@ static int is_sensitive_path(const char *path)
 
     int num = sizeof(sensitive_paths) / sizeof(sensitive_paths[0]);
     for (int i = 0; i < num; i++) {
-        if (my_strstr(path, sensitive_paths[i])) return 1;
+        // 精确匹配或前缀匹配
+        size_t plen = my_strlen(sensitive_paths[i]);
+        if (my_strstr(path, sensitive_paths[i])) {
+            // 对于 /data/adb，需要精确匹配或者是其子路径
+            if (sensitive_paths[i][plen-1] != '/') {
+                return 1;
+            }
+        }
     }
+
+    // 特殊处理：精确匹配 /data/adb 或 /data/adb/
+    if (my_strlen(path) >= 9) {
+        if ((path[0] == '/' && path[1] == 'd' && path[2] == 'a' &&
+             path[3] == 't' && path[4] == 'a' && path[5] == '/' &&
+             path[6] == 'a' && path[7] == 'd' && path[8] == 'b')) {
+            char next = path[9];
+            if (next == '\0' || next == '/') {
+                return 1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -433,7 +457,51 @@ static void before_do_faccessat(hook_fargs4_t *args, void *udata)
     buf[len] = '\0';
 
     if (is_sensitive_path(buf)) {
-        LOGV("blocked access to: %s\n", buf);
+        LOGV("blocked faccessat: %s\n", buf);
+        args->ret = (uint64_t)(-(long)ENOENT);
+        args->skip_origin = 1;
+    }
+}
+
+// vfs_statx / do_statx hook - 隐藏敏感文件 stat
+static void before_do_statx(hook_fargs5_t *args, void *udata)
+{
+    // do_statx(int dfd, const char __user *filename, unsigned flags, unsigned mask, struct statx __user *buffer)
+    const char __user *filename = (const char __user *)args->arg1;
+
+    if (!filename) return;
+    if (!is_app_process()) return;
+
+    char buf[MAX_PATH_LEN];
+    long len = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
+
+    if (len <= 0 || len >= (long)(sizeof(buf) - 1)) return;
+    buf[len] = '\0';
+
+    if (is_sensitive_path(buf)) {
+        LOGV("blocked statx: %s\n", buf);
+        args->ret = (uint64_t)(-(long)ENOENT);
+        args->skip_origin = 1;
+    }
+}
+
+// do_sys_openat2 hook - 阻止打开敏感文件
+static void before_do_sys_openat2(hook_fargs4_t *args, void *udata)
+{
+    // do_sys_openat2(int dfd, const char __user *filename, struct open_how *how)
+    const char __user *filename = (const char __user *)args->arg1;
+
+    if (!filename) return;
+    if (!is_app_process()) return;
+
+    char buf[MAX_PATH_LEN];
+    long len = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
+
+    if (len <= 0 || len >= (long)(sizeof(buf) - 1)) return;
+    buf[len] = '\0';
+
+    if (is_sensitive_path(buf)) {
+        LOGV("blocked openat2: %s\n", buf);
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
     }
@@ -615,7 +683,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
-    // 5. Hook do_faccessat - 隐藏敏感文件
+    // 5. Hook do_faccessat - 隐藏敏感文件 (access 系统调用)
     do_faccessat_addr = kallsyms_lookup_name("do_faccessat");
     if (do_faccessat_addr) {
         hook_err_t err = hook_wrap4((void *)do_faccessat_addr,
@@ -630,7 +698,43 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
-    // 6. Hook proc_pid_status - 隐藏 TracerPid
+    // 6. Hook do_statx / vfs_statx - 隐藏敏感文件 (stat 系统调用)
+    do_statx_addr = kallsyms_lookup_name("do_statx");
+    if (!do_statx_addr) {
+        do_statx_addr = kallsyms_lookup_name("vfs_statx");
+    }
+    if (do_statx_addr) {
+        hook_err_t err = hook_wrap5((void *)do_statx_addr,
+                                    before_do_statx,
+                                    (void *)0,
+                                    (void *)0);
+        if (err == HOOK_NO_ERR) {
+            LOGV("[+] do_statx hooked at 0x%llx\n", do_statx_addr);
+            hooks_installed++;
+        } else {
+            do_statx_addr = 0;
+        }
+    }
+
+    // 7. Hook do_sys_openat2 - 阻止打开敏感文件 (open 系统调用)
+    do_sys_openat2_addr = kallsyms_lookup_name("do_sys_openat2");
+    if (!do_sys_openat2_addr) {
+        do_sys_openat2_addr = kallsyms_lookup_name("do_sys_open");
+    }
+    if (do_sys_openat2_addr) {
+        hook_err_t err = hook_wrap4((void *)do_sys_openat2_addr,
+                                    before_do_sys_openat2,
+                                    (void *)0,
+                                    (void *)0);
+        if (err == HOOK_NO_ERR) {
+            LOGV("[+] do_sys_openat2 hooked at 0x%llx\n", do_sys_openat2_addr);
+            hooks_installed++;
+        } else {
+            do_sys_openat2_addr = 0;
+        }
+    }
+
+    // 8. Hook proc_pid_status - 隐藏 TracerPid
     proc_pid_status_addr = kallsyms_lookup_name("proc_pid_status");
     if (proc_pid_status_addr) {
         hook_err_t err = hook_wrap2((void *)proc_pid_status_addr,
@@ -645,7 +749,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
-    // 7. Hook comm_show 或 __get_task_comm - 隐藏线程名
+    // 9. Hook comm_show 或 __get_task_comm - 隐藏线程名
     uint64_t comm_show_addr_local = kallsyms_lookup_name("comm_show");
     if (comm_show_addr_local) {
         hook_err_t err = hook_wrap2((void *)comm_show_addr_local,
@@ -701,6 +805,14 @@ static long frida_hide_exit(void *__user reserved)
     if (proc_pid_status_addr) {
         unhook((void *)proc_pid_status_addr);
         proc_pid_status_addr = 0;
+    }
+    if (do_sys_openat2_addr) {
+        unhook((void *)do_sys_openat2_addr);
+        do_sys_openat2_addr = 0;
+    }
+    if (do_statx_addr) {
+        unhook((void *)do_statx_addr);
+        do_statx_addr = 0;
     }
     if (do_faccessat_addr) {
         unhook((void *)do_faccessat_addr);
