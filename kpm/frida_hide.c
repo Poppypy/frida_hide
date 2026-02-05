@@ -26,6 +26,12 @@ KPM_DESCRIPTION("Hide Frida/Root/Xposed detection - Ultimate Edition");
 #define UID_APP_START 10000
 #define MAX_PATH_LEN 256
 
+// VM flags 定义 (来自 linux/mm.h)
+#define VM_READ     0x00000001
+#define VM_WRITE    0x00000002
+#define VM_EXEC     0x00000004
+#define VM_SHARED   0x00000008
+
 // ==================== 结构体定义 ====================
 
 struct seq_file {
@@ -53,6 +59,23 @@ struct sockaddr_in6 {
     unsigned int sin6_scope_id;
 };
 
+// vm_area_struct 简化定义 (用于访问关键字段)
+// 注意：不同内核版本布局可能不同，这里使用常见的 ARM64 Android 内核布局
+struct vm_area_struct_common {
+    unsigned long vm_start;
+    unsigned long vm_end;
+    struct vm_area_struct_common *vm_next;
+    struct vm_area_struct_common *vm_prev;
+    void *vm_mm;              // struct mm_struct *
+    unsigned long vm_page_prot_padding;  // pgprot_t (通常是 unsigned long)
+    unsigned long vm_flags;
+};
+
+// 用于获取 vma 中 vm_file 的偏移量（需要动态计算）
+// 在大多数 ARM64 Android 内核中，vm_file 的偏移量约为 0xa0-0xb0
+#define VMA_VM_FILE_OFFSET_MIN 0x80
+#define VMA_VM_FILE_OFFSET_MAX 0xc0
+
 // ==================== 全局变量 ====================
 
 static uint64_t show_map_vma_addr = 0;
@@ -67,6 +90,10 @@ static uint64_t do_statx_addr = 0;
 static uint64_t do_filp_open_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
 static uint64_t comm_write_addr = 0;
+
+// vm_area_struct 字段偏移量（在 init 时动态检测）
+static int vma_vm_flags_offset = -1;
+static int vma_vm_file_offset = -1;
 
 // filename 结构体（简化版，用于 do_filp_open）
 struct filename {
@@ -406,20 +433,204 @@ static int is_sensitive_path(const char *path)
 
 // ==================== Hook 函数 ====================
 
+// 辅助函数：获取 vma 的 vm_flags
+static unsigned long *get_vma_flags_ptr(void *vma)
+{
+    if (!vma || vma_vm_flags_offset < 0) return 0;
+    return (unsigned long *)((char *)vma + vma_vm_flags_offset);
+}
+
+// 辅助函数：获取 vma 的 vm_file
+// 尝试多个偏移量以提高兼容性
+static void *get_vma_file(void *vma)
+{
+    if (!vma) return 0;
+
+    // 如果已设置偏移量，先尝试它
+    if (vma_vm_file_offset > 0) {
+        void **file_ptr = (void **)((char *)vma + vma_vm_file_offset);
+        void *file = *file_ptr;
+        if (file && ((unsigned long)file > 0xffff000000000000UL) &&
+            ((unsigned long)file < 0xffffffffffffffffUL)) {
+            return file;
+        }
+    }
+
+    // 尝试其他常见偏移量（Linux 5.4 ARM64）
+    static const int file_offsets[] = {0x98, 0x90, 0xa0, 0x88, 0xa8};
+
+    for (int i = 0; i < sizeof(file_offsets)/sizeof(file_offsets[0]); i++) {
+        if (file_offsets[i] == vma_vm_file_offset) continue;  // 已经尝试过
+
+        void **file_ptr = (void **)((char *)vma + file_offsets[i]);
+        void *file = *file_ptr;
+
+        // 验证是否是有效的内核指针
+        if (file && ((unsigned long)file > 0xffff000000000000UL) &&
+            ((unsigned long)file < 0xffffffffffffffffUL)) {
+            return file;
+        }
+    }
+
+    return 0;
+}
+
+// 辅助函数：从 file 获取文件路径名
+// 使用 d_path 内核函数（如果可用）或手动遍历
+static const char *get_file_name_simple(void *file)
+{
+    if (!file) return 0;
+
+    // 方法1：直接从 file 结构体获取 dentry
+    // struct file 布局（ARM64 Linux 5.x/6.x）：
+    // 0x00: f_u (union)
+    // 0x08: f_path.mnt
+    // 0x10: f_path.dentry
+    // 或者
+    // 0x10: f_path.mnt
+    // 0x18: f_path.dentry
+
+    void *dentry = 0;
+
+    // 尝试常见的 dentry 偏移
+    static const int dentry_offsets[] = {0x10, 0x18, 0x20, 0x08};
+
+    for (int i = 0; i < sizeof(dentry_offsets)/sizeof(dentry_offsets[0]); i++) {
+        void **ptr = (void **)((char *)file + dentry_offsets[i]);
+        void *d = *ptr;
+
+        // 验证是否是有效的内核指针
+        if (d && ((unsigned long)d > 0xffff000000000000UL) &&
+            ((unsigned long)d < 0xffffffffffffffffUL)) {
+            // 进一步验证：dentry 的第一个字段通常是 d_flags (unsigned int)
+            // 或者检查 d_name 结构
+            dentry = d;
+            break;
+        }
+    }
+
+    if (!dentry) return 0;
+
+    // 从 dentry 获取 d_name
+    // struct dentry 布局（ARM64 Linux 5.x/6.x）：
+    // d_name 是 struct qstr，包含 { hash, len, name }
+    // d_name 在 dentry 中的偏移通常是 0x20 或 0x28
+    // qstr.name 在 qstr 中的偏移是 0x08（在 hash 和 len 之后）
+
+    static const int qstr_offsets[] = {0x20, 0x28, 0x30, 0x18, 0x38};
+
+    for (int i = 0; i < sizeof(qstr_offsets)/sizeof(qstr_offsets[0]); i++) {
+        // qstr 结构: { unsigned int hash; unsigned int len; const char *name; }
+        // name 指针在 qstr 偏移 0x08 处
+        const char **name_ptr = (const char **)((char *)dentry + qstr_offsets[i] + 0x08);
+        const char *name = *name_ptr;
+
+        // 验证 name 指针
+        if (name && ((unsigned long)name > 0xffff000000000000UL) &&
+            ((unsigned long)name < 0xffffffffffffffffUL)) {
+            // 验证是否是有效的文件名（以字母或数字开头）
+            char c = name[0];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '.') {
+                return name;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// 检查是否是需要隐藏 RWX 权限的系统库
+static int is_system_lib_for_rwx_fix(const char *name)
+{
+    if (!name) return 0;
+
+    // 检查常见的被 Frida hook 的系统库
+    if (my_strstr(name, "libc.so")) return 1;
+    if (my_strstr(name, "libc++.so")) return 1;
+    if (my_strstr(name, "libdl.so")) return 1;
+    if (my_strstr(name, "libm.so")) return 1;
+    if (my_strstr(name, "liblog.so")) return 1;
+    if (my_strstr(name, "libart.so")) return 1;
+    if (my_strstr(name, "libbase.so")) return 1;
+    if (my_strstr(name, "linker")) return 1;
+    if (my_strstr(name, "libandroid_runtime.so")) return 1;
+    if (my_strstr(name, "libutils.so")) return 1;
+    if (my_strstr(name, "libbinder.so")) return 1;
+
+    return 0;
+}
+
 // show_map_vma hook - 隐藏 frida 映射并修复 RWX 权限
+// 函数签名: void show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 {
     struct seq_file *m = (struct seq_file *)args->arg0;
-    args->local.data0 = 0;
+    void *vma = (void *)args->arg1;
+
+    args->local.data0 = 0;  // 保存 seq_file count
+    args->local.data1 = 0;  // 保存原始 vm_flags（如果需要修改）
 
     if (m && m->buf) {
         args->local.data0 = (uint64_t)m->count;
     }
+
+    if (!vma) return;
+    if (vma_vm_flags_offset < 0) return;  // 偏移量未设置
+
+    // 获取 vm_flags 指针
+    unsigned long *flags_ptr = get_vma_flags_ptr(vma);
+    if (!flags_ptr) return;
+
+    unsigned long flags = *flags_ptr;
+
+    // 验证 flags 是否合理（应该包含基本的权限位）
+    // 如果 flags 看起来不像权限标志，说明偏移量可能不对
+    if (flags == 0 || flags > 0xFFFFFFFF) {
+        return;  // 不合理的值，跳过
+    }
+
+    // 检查是否是 RWX 权限
+    if ((flags & (VM_READ | VM_WRITE | VM_EXEC)) != (VM_READ | VM_WRITE | VM_EXEC)) {
+        return;  // 不是 RWX，不需要处理
+    }
+
+    // 检查是否是文件映射（有 vm_file）
+    void *file = get_vma_file(vma);
+    if (!file) return;  // 匿名映射或偏移量不对，不处理
+
+    // 获取文件名
+    const char *name = get_file_name_simple(file);
+    if (!name) return;
+
+    // 检查是否是需要修复的系统库
+    if (!is_system_lib_for_rwx_fix(name)) return;
+
+    // 保存原始 flags
+    args->local.data1 = flags;
+
+    // 临时清除 VM_WRITE 标志，让输出显示 r-x 而不是 rwx
+    *flags_ptr = flags & ~VM_WRITE;
+
+    LOGV("temp clear VM_WRITE for %s (flags: 0x%lx -> 0x%lx)\n",
+         name, flags, *flags_ptr);
 }
 
 static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 {
     struct seq_file *m = (struct seq_file *)args->arg0;
+    void *vma = (void *)args->arg1;
+
+    // 恢复原始 vm_flags（如果之前修改过）
+    if (args->local.data1 && vma) {
+        unsigned long original_flags = args->local.data1;
+        unsigned long *flags_ptr = get_vma_flags_ptr(vma);
+
+        if (flags_ptr) {
+            *flags_ptr = original_flags;
+            LOGV("restored vm_flags: 0x%lx\n", original_flags);
+        }
+    }
 
     if (!m || !m->buf) return;
 
@@ -444,7 +655,8 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
         return;
     }
 
-    // 3. 修复 RWX 权限 - 将 rwxp 显示为 r-xp
+    // 3. 修复 RWX 权限 - 作为后备方案，修改输出字符串
+    // 如果方案 A（修改 vm_flags）成功，这里应该不会再看到 rwx
     fix_rwx_permission(new_data, new_len);
 }
 
@@ -706,9 +918,36 @@ static void after_get_task_comm(hook_fargs3_t *args, void *udata)
 
 // ==================== 模块入口 ====================
 
+// 动态检测 vm_area_struct 中 vm_flags 和 vm_file 的偏移量
+static void detect_vma_offsets(void)
+{
+    // Linux 5.4 ARM64 内核中 vm_area_struct 的布局：
+    // 0x00: vm_start
+    // 0x08: vm_end
+    // 0x10: vm_next
+    // 0x18: vm_prev
+    // 0x20: vm_rb (rb_node, 24 bytes)
+    // 0x38: rb_subtree_gap
+    // 0x40: vm_mm
+    // 0x48: vm_page_prot (pgprot_t)
+    // 0x50: vm_flags
+    // ...
+    // 0x90-0xa0: vm_file (取决于配置)
+
+    // 对于 5.4.86 内核，使用以下偏移
+    vma_vm_flags_offset = 0x50;  // vm_flags 偏移
+    vma_vm_file_offset = 0x98;   // vm_file 偏移（5.4 内核常见值）
+
+    LOGV("kernel 5.4 detected, using vma offsets: vm_flags=0x%x, vm_file=0x%x\n",
+         vma_vm_flags_offset, vma_vm_file_offset);
+}
+
 static long frida_hide_init(const char *args, const char *event, void *__user reserved)
 {
     LOGV("loading ultimate version: %s\n", MYKPM_VERSION);
+
+    // 检测 VMA 结构体偏移量
+    detect_vma_offsets();
 
     int hooks_installed = 0;
 
