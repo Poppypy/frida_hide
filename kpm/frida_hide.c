@@ -435,8 +435,8 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
         return;
     }
 
-    // 3. 修复 RWX 权限（针对 libc 等系统库）
-    fix_rwx_permission(new_data, new_len);
+    // 3. 修复 RWX 权限 - 已禁用，会导致 SELinux execmod 拒绝和 APP 闪退
+    // fix_rwx_permission(new_data, new_len);
 }
 
 // tcp_v4_connect hook - 阻断 Frida 端口连接
