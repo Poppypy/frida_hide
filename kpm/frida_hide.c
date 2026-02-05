@@ -250,7 +250,7 @@ static int is_suspicious_anon_mapping(const char *line, size_t len)
     if (!line || len < 10) return 0;
 
     // 检查是否有 rwx 权限
-    char *perm = 0;
+    const char *perm = 0;
     for (size_t i = 0; i < len - 4; i++) {
         if (line[i] == ' ') {
             perm = &line[i + 1];
