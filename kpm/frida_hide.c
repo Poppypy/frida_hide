@@ -60,10 +60,20 @@ static uint64_t show_smap_addr = 0;
 static uint64_t tcp_v4_connect_addr = 0;
 static uint64_t tcp_v6_connect_addr = 0;
 static uint64_t do_faccessat_addr = 0;
-static uint64_t do_statx_addr = 0;
-static uint64_t do_sys_openat2_addr = 0;
+static uint64_t vfs_fstatat_addr = 0;
+static uint64_t do_filp_open_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
 static uint64_t comm_write_addr = 0;
+
+// 用于 getname 的函数指针
+static struct filename *(*kfunc_getname)(const char __user *) = NULL;
+static void (*kfunc_putname)(struct filename *) = NULL;
+
+// filename 结构体（简化版）
+struct filename {
+    const char *name;
+    // 其他字段省略
+};
 
 // ==================== 辅助函数 ====================
 
@@ -441,7 +451,7 @@ static void before_tcp_v6_connect(hook_fargs3_t *args, void *udata)
     args->skip_origin = 1;
 }
 
-// do_faccessat hook - 隐藏敏感文件
+// do_faccessat hook - 隐藏敏感文件 (access 系统调用)
 static void before_do_faccessat(hook_fargs4_t *args, void *udata)
 {
     // do_faccessat(int dfd, const char __user *filename, int mode, int flags)
@@ -463,10 +473,10 @@ static void before_do_faccessat(hook_fargs4_t *args, void *udata)
     }
 }
 
-// vfs_statx / do_statx hook - 隐藏敏感文件 stat
-static void before_do_statx(hook_fargs5_t *args, void *udata)
+// vfs_fstatat hook - 隐藏敏感文件 (stat/fstatat 系统调用)
+// int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat, int flags)
+static void before_vfs_fstatat(hook_fargs4_t *args, void *udata)
 {
-    // do_statx(int dfd, const char __user *filename, unsigned flags, unsigned mask, struct statx __user *buffer)
     const char __user *filename = (const char __user *)args->arg1;
 
     if (!filename) return;
@@ -479,29 +489,27 @@ static void before_do_statx(hook_fargs5_t *args, void *udata)
     buf[len] = '\0';
 
     if (is_sensitive_path(buf)) {
-        LOGV("blocked statx: %s\n", buf);
+        LOGV("blocked fstatat: %s\n", buf);
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
     }
 }
 
-// do_sys_openat2 hook - 阻止打开敏感文件
-static void before_do_sys_openat2(hook_fargs4_t *args, void *udata)
+// do_filp_open hook - 阻止打开敏感文件 (open/openat 系统调用)
+// struct file *do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op)
+static void before_do_filp_open(hook_fargs3_t *args, void *udata)
 {
-    // do_sys_openat2(int dfd, const char __user *filename, struct open_how *how)
-    const char __user *filename = (const char __user *)args->arg1;
+    struct filename *pathname = (struct filename *)args->arg1;
 
-    if (!filename) return;
+    if (!pathname) return;
+    if (!pathname->name) return;
     if (!is_app_process()) return;
 
-    char buf[MAX_PATH_LEN];
-    long len = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
+    const char *path = pathname->name;
 
-    if (len <= 0 || len >= (long)(sizeof(buf) - 1)) return;
-    buf[len] = '\0';
-
-    if (is_sensitive_path(buf)) {
-        LOGV("blocked openat2: %s\n", buf);
+    if (is_sensitive_path(path)) {
+        LOGV("blocked filp_open: %s\n", path);
+        // 返回 ERR_PTR(-ENOENT)
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
     }
@@ -698,39 +706,36 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
-    // 6. Hook do_statx / vfs_statx - 隐藏敏感文件 (stat 系统调用)
-    do_statx_addr = kallsyms_lookup_name("do_statx");
-    if (!do_statx_addr) {
-        do_statx_addr = kallsyms_lookup_name("vfs_statx");
+    // 6. Hook vfs_fstatat - 隐藏敏感文件 (stat/lstat/fstatat 系统调用)
+    vfs_fstatat_addr = kallsyms_lookup_name("vfs_fstatat");
+    if (!vfs_fstatat_addr) {
+        vfs_fstatat_addr = kallsyms_lookup_name("vfs_statx");
     }
-    if (do_statx_addr) {
-        hook_err_t err = hook_wrap5((void *)do_statx_addr,
-                                    before_do_statx,
+    if (vfs_fstatat_addr) {
+        hook_err_t err = hook_wrap4((void *)vfs_fstatat_addr,
+                                    before_vfs_fstatat,
                                     (void *)0,
                                     (void *)0);
         if (err == HOOK_NO_ERR) {
-            LOGV("[+] do_statx hooked at 0x%llx\n", do_statx_addr);
+            LOGV("[+] vfs_fstatat hooked at 0x%llx\n", vfs_fstatat_addr);
             hooks_installed++;
         } else {
-            do_statx_addr = 0;
+            vfs_fstatat_addr = 0;
         }
     }
 
-    // 7. Hook do_sys_openat2 - 阻止打开敏感文件 (open 系统调用)
-    do_sys_openat2_addr = kallsyms_lookup_name("do_sys_openat2");
-    if (!do_sys_openat2_addr) {
-        do_sys_openat2_addr = kallsyms_lookup_name("do_sys_open");
-    }
-    if (do_sys_openat2_addr) {
-        hook_err_t err = hook_wrap4((void *)do_sys_openat2_addr,
-                                    before_do_sys_openat2,
+    // 7. Hook do_filp_open - 阻止打开敏感文件 (open/openat 系统调用)
+    do_filp_open_addr = kallsyms_lookup_name("do_filp_open");
+    if (do_filp_open_addr) {
+        hook_err_t err = hook_wrap3((void *)do_filp_open_addr,
+                                    before_do_filp_open,
                                     (void *)0,
                                     (void *)0);
         if (err == HOOK_NO_ERR) {
-            LOGV("[+] do_sys_openat2 hooked at 0x%llx\n", do_sys_openat2_addr);
+            LOGV("[+] do_filp_open hooked at 0x%llx\n", do_filp_open_addr);
             hooks_installed++;
         } else {
-            do_sys_openat2_addr = 0;
+            do_filp_open_addr = 0;
         }
     }
 
@@ -806,13 +811,13 @@ static long frida_hide_exit(void *__user reserved)
         unhook((void *)proc_pid_status_addr);
         proc_pid_status_addr = 0;
     }
-    if (do_sys_openat2_addr) {
-        unhook((void *)do_sys_openat2_addr);
-        do_sys_openat2_addr = 0;
+    if (do_filp_open_addr) {
+        unhook((void *)do_filp_open_addr);
+        do_filp_open_addr = 0;
     }
-    if (do_statx_addr) {
-        unhook((void *)do_statx_addr);
-        do_statx_addr = 0;
+    if (vfs_fstatat_addr) {
+        unhook((void *)vfs_fstatat_addr);
+        vfs_fstatat_addr = 0;
     }
     if (do_faccessat_addr) {
         unhook((void *)do_faccessat_addr);
