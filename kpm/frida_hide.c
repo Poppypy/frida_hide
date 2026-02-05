@@ -476,13 +476,13 @@ static void before_tcp_v6_connect(hook_fargs3_t *args, void *udata)
 }
 
 // do_faccessat hook - 隐藏敏感文件 (access 系统调用)
+// 注意：不同内核版本参数数量可能不同 (3或4个参数)
 static void before_do_faccessat(hook_fargs4_t *args, void *udata)
 {
-    // do_faccessat(int dfd, const char __user *filename, int mode, int flags)
+    // do_faccessat(int dfd, const char __user *filename, int mode [, int flags])
     const char __user *filename = (const char __user *)args->arg1;
 
     if (!filename) return;
-    if (!is_app_process()) return;
 
     char buf[MAX_PATH_LEN];
     long len = compat_strncpy_from_user(buf, filename, sizeof(buf) - 1);
@@ -490,10 +490,15 @@ static void before_do_faccessat(hook_fargs4_t *args, void *udata)
     if (len <= 0 || len >= (long)(sizeof(buf) - 1)) return;
     buf[len] = '\0';
 
+    // 先检查路径，再检查进程（方便调试）
     if (is_sensitive_path(buf)) {
-        LOGV("blocked faccessat: %s\n", buf);
-        args->ret = (uint64_t)(-(long)ENOENT);
-        args->skip_origin = 1;
+        uid_t uid = current_uid();
+        // 放宽检查：UID >= 1000 都拦截（包括 system 进程）
+        if (uid >= 1000) {
+            LOGV("blocked faccessat: uid=%d path=%s\n", uid, buf);
+            args->ret = (uint64_t)(-(long)ENOENT);
+            args->skip_origin = 1;
+        }
     }
 }
 
@@ -770,28 +775,39 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
             LOGV("[+] do_faccessat hooked at 0x%llx\n", do_faccessat_addr);
             hooks_installed++;
         } else {
+            LOGV("[-] hook do_faccessat FAILED: %d\n", err);
             do_faccessat_addr = 0;
         }
+    } else {
+        LOGV("[-] do_faccessat NOT FOUND\n");
     }
 
-    // 5.1 Hook __arm64_sys_faccessat2 - faccessat2 系统调用入口
-    sys_faccessat2_addr = kallsyms_lookup_name("__arm64_sys_faccessat2");
-    if (!sys_faccessat2_addr) {
-        sys_faccessat2_addr = kallsyms_lookup_name("__se_sys_faccessat2");
-    }
-    if (!sys_faccessat2_addr) {
-        sys_faccessat2_addr = kallsyms_lookup_name("do_faccessat2");
-    }
-    if (sys_faccessat2_addr) {
-        hook_err_t err = hook_wrap4((void *)sys_faccessat2_addr,
-                                    before_do_faccessat,
-                                    (void *)0,
-                                    (void *)0);
-        if (err == HOOK_NO_ERR) {
-            LOGV("[+] sys_faccessat2 hooked at 0x%llx\n", sys_faccessat2_addr);
-            hooks_installed++;
-        } else {
-            sys_faccessat2_addr = 0;
+    // 5.1 尝试多个 faccessat2 相关符号
+    static const char *faccessat2_syms[] = {
+        "__arm64_sys_faccessat2",
+        "__se_sys_faccessat2",
+        "do_faccessat2",
+        "__arm64_sys_faccessat",
+        "__se_sys_faccessat",
+    };
+    for (int i = 0; i < sizeof(faccessat2_syms)/sizeof(faccessat2_syms[0]); i++) {
+        uint64_t addr = kallsyms_lookup_name(faccessat2_syms[i]);
+        if (addr) {
+            LOGV("[*] found %s at 0x%llx\n", faccessat2_syms[i], addr);
+            // 避免重复 hook 同一地址
+            if (addr != do_faccessat_addr && sys_faccessat2_addr == 0) {
+                hook_err_t err = hook_wrap4((void *)addr,
+                                            before_do_faccessat,
+                                            (void *)0,
+                                            (void *)0);
+                if (err == HOOK_NO_ERR) {
+                    LOGV("[+] %s hooked at 0x%llx\n", faccessat2_syms[i], addr);
+                    sys_faccessat2_addr = addr;
+                    hooks_installed++;
+                } else {
+                    LOGV("[-] hook %s FAILED: %d\n", faccessat2_syms[i], err);
+                }
+            }
         }
     }
 
