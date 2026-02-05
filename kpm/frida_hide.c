@@ -224,6 +224,7 @@ static int is_frida_mapping(const char *buf, size_t len)
 }
 
 // 检查并修复 RWX 权限 - 将 rwxp 改为 r-xp
+// 注意：这只是修改 /proc/self/maps 的输出字符串，不影响实际内存权限
 static void fix_rwx_permission(char *line, size_t len)
 {
     if (!line || len < 20) return;
@@ -240,15 +241,23 @@ static void fix_rwx_permission(char *line, size_t len)
 
     if (!perm) return;
 
-    // 检查是否是 rwxp 或 rwxs
+    // 检查是否是 rwxp 或 rwxs（可读、可写、可执行）
     if (perm[0] == 'r' && perm[1] == 'w' && perm[2] == 'x') {
-        // 检查是否是 libc.so 或 libdl.so 相关
+        // 检查是否是常见的被 hook 的系统库
+        // Frida inline hook 会修改这些库的代码段，导致权限变为 rwx
         if (my_memmem(line, len, "libc.so", 7) ||
+            my_memmem(line, len, "libc++.so", 9) ||
             my_memmem(line, len, "libdl.so", 8) ||
-            my_memmem(line, len, "linker", 6)) {
-            // 将 rwx 改为 r-x
-            perm[1] = '-';  // rwx -> r-x
-            LOGV("fixed rwx permission in maps\n");
+            my_memmem(line, len, "libm.so", 7) ||
+            my_memmem(line, len, "liblog.so", 9) ||
+            my_memmem(line, len, "libandroid_runtime.so", 21) ||
+            my_memmem(line, len, "libart.so", 9) ||
+            my_memmem(line, len, "libbase.so", 10) ||
+            my_memmem(line, len, "linker", 6) ||
+            my_memmem(line, len, "/apex/", 6)) {  // apex 下的所有库
+            // 将 rwx 改为 r-x（只修改输出字符串）
+            perm[1] = '-';
+            LOGV("fixed rwx permission in maps output\n");
         }
     }
 }
@@ -435,8 +444,8 @@ static void after_show_map_vma(hook_fargs2_t *args, void *udata)
         return;
     }
 
-    // 3. 修复 RWX 权限 - 已禁用，会导致 SELinux execmod 拒绝和 APP 闪退
-    // fix_rwx_permission(new_data, new_len);
+    // 3. 修复 RWX 权限 - 将 rwxp 显示为 r-xp
+    fix_rwx_permission(new_data, new_len);
 }
 
 // tcp_v4_connect hook - 阻断 Frida 端口连接
