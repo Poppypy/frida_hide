@@ -17,7 +17,10 @@ KPM_DESCRIPTION("Hide Frida/Root/Xposed detection - Ultimate Edition");
 // ==================== 常量定义 ====================
 #define FRIDA_PORT_START 27042
 #define FRIDA_PORT_END 27052
-#define LOGV(fmt, ...) pr_info("frida_hide: " fmt, ##__VA_ARGS__)
+// 日志开关: 1=开启(调试用), 0=关闭(正式使用)
+static int log_enabled = 1;
+
+#define LOGV(fmt, ...) do { if (log_enabled) pr_info("frida_hide: " fmt, ##__VA_ARGS__); } while(0)
 
 #define AF_INET 2
 #define AF_INET6 10
@@ -378,6 +381,8 @@ static int is_sensitive_path(const char *path)
         // Magisk
         "/system/bin/magisk",
         "/sbin/magisk",
+        // Magisk Frida 模块的 frida-server
+        "/system/bin/frida-server",
         // BusyBox
         "/system/bin/busybox",
         "/system/xbin/busybox",
@@ -409,6 +414,9 @@ static int is_sensitive_path(const char *path)
         "/data/local/tmp/re.frida.server",
         "/data/local/tmp/frida-server",
         "/data/local/tmp/frida",
+        // Magisk Frida 模块
+        "/data/adb/modules/magisk-frida",
+        "/data/adb/modules/magiskfrida",
         // 脱壳工具
         "/data/fart",
         "/data/local/tmp/fart",
@@ -570,6 +578,12 @@ static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 
     args->local.data0 = 0;  // 保存 seq_file count
     args->local.data1 = 0;  // 保存原始 vm_flags（如果需要修改）
+    args->local.data2 = 0;  // 标记是否是 app 进程
+
+    // 只对 app 进程生效，避免影响 frida-server 等 root 进程
+    if (!is_app_process()) return;
+
+    args->local.data2 = 1;
 
     if (m && m->buf) {
         args->local.data0 = (uint64_t)m->count;
@@ -618,6 +632,9 @@ static void before_show_map_vma(hook_fargs2_t *args, void *udata)
 
 static void after_show_map_vma(hook_fargs2_t *args, void *udata)
 {
+    // 非 app 进程直接返回
+    if (!args->local.data2) return;
+
     struct seq_file *m = (struct seq_file *)args->arg0;
     void *vma = (void *)args->arg1;
 
@@ -814,6 +831,11 @@ static void before_proc_pid_status(hook_fargs2_t *args, void *udata)
 {
     struct seq_file *m = (struct seq_file *)args->arg0;
     args->local.data0 = 0;
+    args->local.data1 = 0;  // 标记是否是 app 进程
+
+    if (!is_app_process()) return;
+
+    args->local.data1 = 1;
 
     if (m && m->buf) {
         args->local.data0 = (uint64_t)m->count;
@@ -822,6 +844,8 @@ static void before_proc_pid_status(hook_fargs2_t *args, void *udata)
 
 static void after_proc_pid_status(hook_fargs2_t *args, void *udata)
 {
+    if (!args->local.data1) return;  // 非 app 进程跳过
+
     struct seq_file *m = (struct seq_file *)args->arg0;
 
     if (!m || !m->buf) return;
@@ -863,6 +887,12 @@ static void after_proc_pid_status(hook_fargs2_t *args, void *udata)
 static void before_comm_show(hook_fargs2_t *args, void *udata)
 {
     args->local.data0 = 0;
+    args->local.data1 = 0;  // 标记是否是 app 进程
+
+    if (!is_app_process()) return;
+
+    args->local.data1 = 1;
+
     struct seq_file *m = (struct seq_file *)args->arg0;
     if (m && m->buf) {
         args->local.data0 = (uint64_t)m->count;
@@ -871,6 +901,8 @@ static void before_comm_show(hook_fargs2_t *args, void *udata)
 
 static void after_comm_show(hook_fargs2_t *args, void *udata)
 {
+    if (!args->local.data1) return;  // 非 app 进程跳过
+
     struct seq_file *m = (struct seq_file *)args->arg0;
 
     if (!m || !m->buf) return;
@@ -905,6 +937,8 @@ static void after_comm_show(hook_fargs2_t *args, void *udata)
 // __get_task_comm hook
 static void after_get_task_comm(hook_fargs3_t *args, void *udata)
 {
+    if (!is_app_process()) return;  // 只对 app 进程生效
+
     char *buf = (char *)args->arg0;
 
     if (!buf) return;
