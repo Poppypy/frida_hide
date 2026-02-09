@@ -171,10 +171,10 @@ static int is_frida_thread_name(const char *name)
     if (!name || !*name) return 0;
 
     static const char *keywords[] = {
-        // Frida 线程
-        "gmain", "gdbus", "gum-js-loop", "pool-frida",
-        "linjector", "frida", "agent-main", "v8:",
-        "frida-server", "frida-helper",
+        // Frida 线程（精确特征，避免误杀）
+        "gum-js-loop", "pool-frida",
+        "linjector", "frida-server", "frida-helper",
+        "frida-agent", "frida:",
         // Xposed/LSPosed 线程
         "xposed", "lspd", "edxp",
     };
@@ -192,31 +192,33 @@ static int is_frida_mapping(const char *buf, size_t len)
     if (!buf || len == 0) return 0;
 
     static const char *keywords[] = {
-        // ===== Frida 特征 =====
-        "frida", "Frida", "FRIDA",
+        // ===== Frida 特征（精确）=====
         "frida-agent", "frida_agent", "frida-gadget",
         "frida-agent-32.so", "frida-agent-64.so",
         "frida-agent.so", "frida-agent-raw.so",
-        "gadget", "Gadget", "gum-js", "libgum",
-        "linjector", "re.frida.server", "re.frida",
-        "/data/local/tmp/",
+        "frida-server", "frida-helper",
+        "frida-gadget.so", "frida-gadget-",
+        "gum-js-loop", "libgum.so",
+        "linjector", "re.frida.server", "re.frida.",
+        "/data/local/tmp/re.frida",
+        "/data/local/tmp/frida",
 
         // ===== Xposed 特征 =====
-        "xposed", "Xposed", "XposedBridge",
+        "XposedBridge",
         "libxposed_art.so",
         "app_process32_xposed", "app_process64_xposed",
         "app_process32_zposed", "app_process64_zposed",
         "de/robv/android/xposed",
 
         // ===== Riru 特征 =====
-        "libriruloader.so", "libriru_", "libriru_edxp.so",
+        "libriruloader.so", "libriru_edxp.so",
 
         // ===== LSPosed/EdXposed 特征 =====
-        "liblspd.so", "lspd", "edxposed", "EdXposed",
+        "liblspd.so", "edxposed", "EdXposed",
         "/data/misc/edxp_",
 
-        // ===== Magisk 特征 =====
-        "MAGISK_INJ_", "/.magisk/", "magisk",
+        // ===== Magisk 特征（只匹配注入标记，不匹配 "magisk" 本身）=====
+        "MAGISK_INJ_",
 
         // ===== Substrate 特征 =====
         "com.saurik.substrate", "slSubstrate",
@@ -226,7 +228,7 @@ static int is_frida_mapping(const char *buf, size_t len)
         "myfartInvoke", "blackdex", "FunDex",
 
         // ===== 其他 Hook 框架 =====
-        "libsotweak.so", "whale", "SandHook", "epic",
+        "libsotweak.so",
     };
 
     int num = sizeof(keywords) / sizeof(keywords[0]);
@@ -397,16 +399,15 @@ static int is_sensitive_path(const char *path)
 
     // ===== 前缀匹配的路径（目录）=====
     static const char *prefix_paths[] = {
-        // Magisk
+        // Magisk（只匹配 magisk 自身目录，不匹配 /data/adb/modules 整体）
         "/sbin/.magisk",
         "/.magisk",
         "/data/adb/magisk",
-        "/data/adb/modules",
         // KernelSU
         "/data/adb/ksu",
         "/data/adb/ksud",
         // APatch
-        "/data/adb/ap",
+        "/data/adb/ap/",
         "/data/adb/apd",
         // Xposed/EdXposed
         "/data/misc/edxp_",
@@ -728,12 +729,10 @@ static void before_do_faccessat(hook_fargs4_t *args, void *udata)
     if (len <= 0 || len >= (long)(sizeof(buf) - 1)) return;
     buf[len] = '\0';
 
-    // 先检查路径，再检查进程（方便调试）
+    // 只拦截 app 进程（UID >= 10000），不拦截 system_server（UID=1000）
     if (is_sensitive_path(buf)) {
-        uid_t uid = current_uid();
-        // 放宽检查：UID >= 1000 都拦截（包括 system 进程）
-        if (uid >= 1000) {
-            LOGV("blocked faccessat: uid=%d path=%s\n", uid, buf);
+        if (is_app_process()) {
+            LOGV("blocked faccessat: path=%s\n", buf);
             args->ret = (uint64_t)(-(long)ENOENT);
             args->skip_origin = 1;
         }
