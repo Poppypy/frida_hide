@@ -904,14 +904,14 @@ static void before_do_filp_open(hook_fargs3_t *args, void *udata)
 
     // 2. 暂时禁用 /proc/*/mem 和 /proc/*/pagemap 检查
     // 因为可能影响 Frida 注入过程
-    /*
+
     if (is_proc_mem_path(path)) {
         LOGV("blocked proc mem access: %s\n", path);
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
         return;
     }
-    */
+
 }
 
 // proc_pid_status hook - 隐藏 TracerPid
@@ -1442,7 +1442,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
 
     // 12. Hook do_readlinkat - 过滤 FD 符号链接检测
     // 暂时禁用，可能影响 Frida 注入
-    /*
+
     do_readlinkat_addr = kallsyms_lookup_name("do_readlinkat");
     if (!do_readlinkat_addr) {
         // 尝试其他符号名
@@ -1466,7 +1466,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     } else {
         LOGV("[-] do_readlinkat NOT FOUND\n");
     }
-    */
+
 
     LOGV("=== loaded successfully, %d hooks installed ===\n", hooks_installed);
     return 0;
