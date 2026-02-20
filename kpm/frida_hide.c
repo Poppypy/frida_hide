@@ -92,6 +92,7 @@ static uint64_t vfs_statx_addr = 0;
 static uint64_t do_statx_addr = 0;
 static uint64_t do_filp_open_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
+static uint64_t proc_tid_status_addr = 0;
 static uint64_t comm_write_addr = 0;
 static uint64_t do_readlinkat_addr = 0;
 
@@ -902,14 +903,14 @@ static void before_do_filp_open(hook_fargs3_t *args, void *udata)
 
     // 2. 暂时禁用 /proc/*/mem 和 /proc/*/pagemap 检查
     // 因为可能影响 Frida 注入过程
-    /*
+
     if (is_proc_mem_path(path)) {
         LOGV("blocked proc mem access: %s\n", path);
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
         return;
     }
-    */
+
 }
 
 // proc_pid_status hook - 隐藏 TracerPid
@@ -1289,7 +1290,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
-    // 10. Hook proc_pid_status - 隐藏 TracerPid
+    // 10. Hook proc_pid_status - 隐藏 TracerPid (进程级别)
     proc_pid_status_addr = kallsyms_lookup_name("proc_pid_status");
     if (proc_pid_status_addr) {
         hook_err_t err = hook_wrap2((void *)proc_pid_status_addr,
@@ -1301,6 +1302,44 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
             hooks_installed++;
         } else {
             proc_pid_status_addr = 0;
+        }
+    }
+
+    // 10.1 Hook proc_tid_status - 隐藏 TracerPid (线程级别 /proc/self/task/TID/status)
+    proc_tid_status_addr = kallsyms_lookup_name("proc_tid_status");
+    if (proc_tid_status_addr) {
+        hook_err_t err = hook_wrap2((void *)proc_tid_status_addr,
+                                    before_proc_pid_status,  // 复用相同的 before/after 函数
+                                    after_proc_pid_status,
+                                    (void *)0);
+        if (err == HOOK_NO_ERR) {
+            LOGV("[+] proc_tid_status hooked at 0x%llx\n", proc_tid_status_addr);
+            hooks_installed++;
+        } else {
+            LOGV("[-] hook proc_tid_status FAILED: %d\n", err);
+            proc_tid_status_addr = 0;
+        }
+    } else {
+        LOGV("[-] proc_tid_status NOT FOUND, trying alternative...\n");
+        // 尝试其他可能的符号名
+        static const char *tid_status_syms[] = {
+            "proc_task_status",
+            "proc_tid_stat",
+        };
+        for (int i = 0; i < sizeof(tid_status_syms)/sizeof(tid_status_syms[0]); i++) {
+            uint64_t addr = kallsyms_lookup_name(tid_status_syms[i]);
+            if (addr) {
+                hook_err_t err = hook_wrap2((void *)addr,
+                                            before_proc_pid_status,
+                                            after_proc_pid_status,
+                                            (void *)0);
+                if (err == HOOK_NO_ERR) {
+                    LOGV("[+] %s hooked at 0x%llx\n", tid_status_syms[i], addr);
+                    proc_tid_status_addr = addr;
+                    hooks_installed++;
+                    break;
+                }
+            }
         }
     }
 
@@ -1336,7 +1375,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
 
     // 12. Hook do_readlinkat - 过滤 FD 符号链接检测
     // 暂时禁用，可能影响 Frida 注入
-    /*
+
     do_readlinkat_addr = kallsyms_lookup_name("do_readlinkat");
     if (!do_readlinkat_addr) {
         // 尝试其他符号名
@@ -1360,7 +1399,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     } else {
         LOGV("[-] do_readlinkat NOT FOUND\n");
     }
-    */
+
 
     LOGV("=== loaded successfully, %d hooks installed ===\n", hooks_installed);
     return 0;
@@ -1392,6 +1431,10 @@ static long frida_hide_exit(void *__user reserved)
     if (proc_pid_status_addr) {
         unhook((void *)proc_pid_status_addr);
         proc_pid_status_addr = 0;
+    }
+    if (proc_tid_status_addr) {
+        unhook((void *)proc_tid_status_addr);
+        proc_tid_status_addr = 0;
     }
     if (do_filp_open_addr) {
         unhook((void *)do_filp_open_addr);
