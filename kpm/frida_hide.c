@@ -53,11 +53,11 @@ static int vma_vm_flags_offset=0x50,vma_vm_file_offset=0x98;
 static inline size_t my_strlen(const char*s){if(!s)return 0;const char*p=s;while(*p)p++;return p-s;}
 static inline int my_strcmp(const char*s1,const char*s2){while(*s1&&*s1==*s2){s1++;s2++;}return*(unsigned char*)s1-*(unsigned char*)s2;}
 static inline int my_startswith(const char*s,const char*p){if(!s||!p)return 0;while(*p)if(*s++!=*p++)return 0;return 1;}
-static inline char*my_strstr(const char*h,const char*n){if(!h||!n||!*n)return(char*)h;size_t nl=my_strlen(n);while(*h){const char*p=h,*q=n;while(*p&&*q&&*p==*q){p++;q++;}if(!*q)return(char*)h;h++;}return 0;}
+static inline char*my_strstr(const char*h,const char*n){if(!h||!n||!*n)return(char*)h;size_t nlen=my_strlen(n);while(*h){const char*p=h,*q=n;while(*p&&*q&&*p==*q){p++;q++;}if(!*q)return(char*)h;h++;}return 0;}
 static inline void*my_memmem(const void*h,size_t hl,const void*n,size_t nl){if(!h||!n||hl<nl||!nl)return 0;const char*hp=h,*np=n;for(size_t i=0;i<=hl-nl;i++){int m=1;for(size_t j=0;j<nl&&m;j++)if(hp[i+j]!=np[j])m=0;if(m)return(void*)(hp+i);}return 0;}
 static inline uint16_t bswap16(uint16_t v){return(v>>8)|(v<<8);}
 static inline int is_app(void){return current_uid()>=UID_APP_START;}
-static inline int is_kptr(void*p){return p&&((unsigned long)p>0xffff000000000000UL);}
+static inline int is_kptr(const void*p){return p&&((unsigned long)p>0xffff000000000000UL);}
 
 // Detection helpers - Frida mapping keywords (for maps filtering)
 static inline int is_frida_mapping(const char*buf,size_t len){
@@ -342,7 +342,6 @@ static void after_do_readlinkat(hook_fargs4_t*args,void*udata){
     if(!is_app())return;
     const char __user*pathname=(const char __user*)args->arg1;
     char __user*buf=(char __user*)args->arg2;
-    int bufsiz=(int)args->arg3;
     long ret=(long)args->ret;
     if(ret<=0||!buf||!pathname)return;
     // Check if reading /proc/self/fd/*
@@ -367,7 +366,7 @@ static void after_do_readlinkat(hook_fargs4_t*args,void*udata){
 // ==================== Init/Exit ====================
 
 static long frida_hide_init(const char*args,const char*event,void*__user reserved){
-    LOGV("init v%s\n",KPM_VERSION);
+    LOGV("init v3.0.0-venus\n");
     int count=0;
 
     // Maps/Smaps filtering
