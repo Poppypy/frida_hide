@@ -93,6 +93,7 @@ static uint64_t do_statx_addr = 0;
 static uint64_t do_filp_open_addr = 0;
 static uint64_t proc_pid_status_addr = 0;
 static uint64_t proc_tid_status_addr = 0;
+static uint64_t proc_pid_cmdline_addr = 0;
 static uint64_t comm_write_addr = 0;
 static uint64_t do_readlinkat_addr = 0;
 
@@ -903,14 +904,14 @@ static void before_do_filp_open(hook_fargs3_t *args, void *udata)
 
     // 2. 暂时禁用 /proc/*/mem 和 /proc/*/pagemap 检查
     // 因为可能影响 Frida 注入过程
-
+    /*
     if (is_proc_mem_path(path)) {
         LOGV("blocked proc mem access: %s\n", path);
         args->ret = (uint64_t)(-(long)ENOENT);
         args->skip_origin = 1;
         return;
     }
-
+    */
 }
 
 // proc_pid_status hook - 隐藏 TracerPid
@@ -1034,6 +1035,54 @@ static void after_get_task_comm(hook_fargs3_t *args, void *udata)
         buf[0] = 'k'; buf[1] = 'w'; buf[2] = 'o'; buf[3] = 'r';
         buf[4] = 'k'; buf[5] = 'e'; buf[6] = 'r'; buf[7] = '\0';
         LOGV("hidden frida thread comm\n");
+    }
+}
+
+// proc_pid_cmdline hook - 过滤 cmdline 中的敏感信息
+// int proc_pid_cmdline(struct seq_file *m, void *v)
+// cmdline 通常只包含包名，但某些情况下可能泄露信息
+static void before_proc_pid_cmdline(hook_fargs2_t *args, void *udata)
+{
+    struct seq_file *m = (struct seq_file *)args->arg0;
+    args->local.data0 = 0;
+    args->local.data1 = 0;  // 标记是否是 app 进程
+
+    if (!is_app_process()) return;
+
+    args->local.data1 = 1;
+
+    if (m && m->buf) {
+        args->local.data0 = (uint64_t)m->count;
+    }
+}
+
+static void after_proc_pid_cmdline(hook_fargs2_t *args, void *udata)
+{
+    if (!args->local.data1) return;  // 非 app 进程跳过
+
+    struct seq_file *m = (struct seq_file *)args->arg0;
+
+    if (!m || !m->buf) return;
+
+    size_t old_count = (size_t)args->local.data0;
+    if (m->count <= old_count) return;
+
+    char *new_data = m->buf + old_count;
+    size_t new_len = m->count - old_count;
+
+    // cmdline 中的敏感关键词（虽然正常情况下不应该出现）
+    static const char *sensitive_keywords[] = {
+        "frida", "gum-js-loop", "linjector", "gmain", "gdbus",
+        "re.frida.server", "frida-server", "frida-gadget",
+    };
+
+    for (int i = 0; i < sizeof(sensitive_keywords)/sizeof(sensitive_keywords[0]); i++) {
+        if (my_memmem(new_data, new_len, sensitive_keywords[i], my_strlen(sensitive_keywords[i]))) {
+            // 如果发现敏感词，清空输出
+            m->count = old_count;
+            LOGV("hidden sensitive cmdline content: %s\n", sensitive_keywords[i]);
+            return;
+        }
     }
 }
 
@@ -1343,6 +1392,24 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
         }
     }
 
+    // 10.2 Hook proc_pid_cmdline - 过滤 cmdline 中的敏感信息
+    proc_pid_cmdline_addr = kallsyms_lookup_name("proc_pid_cmdline");
+    if (proc_pid_cmdline_addr) {
+        hook_err_t err = hook_wrap2((void *)proc_pid_cmdline_addr,
+                                    before_proc_pid_cmdline,
+                                    after_proc_pid_cmdline,
+                                    (void *)0);
+        if (err == HOOK_NO_ERR) {
+            LOGV("[+] proc_pid_cmdline hooked at 0x%llx\n", proc_pid_cmdline_addr);
+            hooks_installed++;
+        } else {
+            LOGV("[-] hook proc_pid_cmdline FAILED: %d\n", err);
+            proc_pid_cmdline_addr = 0;
+        }
+    } else {
+        LOGV("[-] proc_pid_cmdline NOT FOUND\n");
+    }
+
     // 11. Hook comm_show 或 __get_task_comm - 隐藏线程名
     uint64_t comm_show_addr_local = kallsyms_lookup_name("comm_show");
     if (comm_show_addr_local) {
@@ -1375,7 +1442,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
 
     // 12. Hook do_readlinkat - 过滤 FD 符号链接检测
     // 暂时禁用，可能影响 Frida 注入
-
+    /*
     do_readlinkat_addr = kallsyms_lookup_name("do_readlinkat");
     if (!do_readlinkat_addr) {
         // 尝试其他符号名
@@ -1399,7 +1466,7 @@ static long frida_hide_init(const char *args, const char *event, void *__user re
     } else {
         LOGV("[-] do_readlinkat NOT FOUND\n");
     }
-
+    */
 
     LOGV("=== loaded successfully, %d hooks installed ===\n", hooks_installed);
     return 0;
@@ -1435,6 +1502,10 @@ static long frida_hide_exit(void *__user reserved)
     if (proc_tid_status_addr) {
         unhook((void *)proc_tid_status_addr);
         proc_tid_status_addr = 0;
+    }
+    if (proc_pid_cmdline_addr) {
+        unhook((void *)proc_pid_cmdline_addr);
+        proc_pid_cmdline_addr = 0;
     }
     if (do_filp_open_addr) {
         unhook((void *)do_filp_open_addr);
