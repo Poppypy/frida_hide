@@ -176,6 +176,8 @@ static int is_frida_thread_name(const char *name)
         "gum-js-loop", "pool-frida",
         "linjector", "frida-server", "frida-helper",
         "frida-agent", "frida:",
+        // GLib 线程（Frida 使用 GLib）
+        "gmain", "gdbus", "gsource",
         // Xposed/LSPosed 线程
         "xposed", "lspd", "edxp",
     };
@@ -1042,12 +1044,12 @@ static void after_do_readlinkat(hook_fargs5_t *args, void *udata)
     if (!is_app_process()) return;
 
     // 获取返回值（读取的字节数）
-    ssize_t ret = (ssize_t)args->ret;
+    long ret = (long)args->ret;
     if (ret <= 0) return;
 
     const char __user *path = (const char __user *)args->arg1;
     char __user *buf = (char __user *)args->arg2;
-    size_t bufsiz = (size_t)args->arg3;
+    unsigned long bufsiz = (unsigned long)args->arg3;
 
     if (!path || !buf) return;
 
@@ -1061,9 +1063,9 @@ static void after_do_readlinkat(hook_fargs5_t *args, void *udata)
 
     // 读取返回的链接目标
     char link_buf[MAX_PATH_LEN];
-    if ((size_t)ret >= sizeof(link_buf)) return;
+    if ((unsigned long)ret >= sizeof(link_buf)) return;
 
-    long copy_len = compat_strncpy_from_user(link_buf, buf, (size_t)ret);
+    long copy_len = compat_strncpy_from_user(link_buf, buf, (unsigned long)ret);
     if (copy_len <= 0) return;
     link_buf[copy_len] = '\0';
 
